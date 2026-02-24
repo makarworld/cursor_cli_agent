@@ -1,0 +1,59 @@
+# Cursor CLI Agent - Docker Compose
+# Развёртывание: веб-интерфейс (CloudCLI) + Telegram бот
+
+services:
+  # =============================================================================
+  # CloudCLI - Веб-интерфейс для Cursor CLI
+  # Доступ: http://<сервер>:3001
+  # =============================================================================
+  cloudcli:
+    build:
+      context: ./cloudcli
+      dockerfile: Dockerfile
+    container_name: cursor-cloudcli
+    restart: unless-stopped
+    ports:
+      - "${CLOUDCLI_PORT:-3001}:3001"
+    environment:
+      - PORT=3001
+      - HOST=0.0.0.0
+      - NODE_ENV=production
+      - CURSOR_API_KEY=${CURSOR_API_KEY}
+    volumes:
+      # Рабочая директория для проектов (Cursor CLI)
+      - cursor-workspace:/workspace
+      # Данные CloudCLI (сессии, БД)
+      - cloudcli-data:/app/data
+  # =============================================================================
+  # Telegram бот для Cursor CLI
+  # Управление Cursor CLI через Telegram
+  # =============================================================================
+  telegram-bot:
+    build:
+      context: ./telegram-bot
+      dockerfile: Dockerfile
+    container_name: cursor-telegram-bot
+    restart: unless-stopped
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - ALLOWED_USER_IDS=${ALLOWED_USER_IDS}
+      - WORKSPACE_DIR=/workspace
+      - CURSOR_CLI_PATH=${CURSOR_CLI_PATH:-cursor-agent}
+      - CURSOR_MODEL=${CURSOR_MODEL:-Composer 1.5}
+      - CURSOR_API_KEY=${CURSOR_API_KEY}
+      - CURSOR_TIMEOUT_SECONDS=${CURSOR_TIMEOUT_SECONDS:-300}
+    volumes:
+      # Общая рабочая директория с CloudCLI
+      - cursor-workspace:/workspace
+      # Сессии cursor-agent (контекст между сообщениями)
+      - cursor-sessions:/root/.cursor
+    env_file:
+      - .env
+
+volumes:
+  cursor-workspace:
+    driver: local
+  cloudcli-data:
+    driver: local
+  cursor-sessions:
+    driver: local
