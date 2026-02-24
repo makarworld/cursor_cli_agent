@@ -3,6 +3,7 @@ Cursor CLI Telegram Bot
 Управление Cursor CLI через Telegram.
 Использует cursor-agent в headless режиме с сохранением контекста.
 """
+
 import asyncio
 import html
 import json
@@ -32,12 +33,9 @@ logger = logging.getLogger(__name__)
 
 # Конфигурация
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-ALLOWED_USER_IDS = [
-    int(x.strip())
-    for x in os.getenv("ALLOWED_USER_IDS", "").split(",")
-    if x.strip()
-]
+ALLOWED_USER_IDS = [int(x.strip()) for x in os.getenv("ALLOWED_USER_IDS", "").split(",") if x.strip()]
 WORKSPACE_DIR = Path(os.getenv("WORKSPACE_DIR", "/workspace"))
+FILES_DIR = WORKSPACE_DIR / "files"
 CURSOR_CLI_PATH = os.getenv("CURSOR_CLI_PATH", "cursor-agent")
 CURSOR_MODEL = os.getenv("CURSOR_MODEL", "Composer 1.5")
 CURSOR_API_KEY = os.getenv("CURSOR_API_KEY")
@@ -46,32 +44,7 @@ MAX_RESPONSE_LENGTH = 4000  # Лимит Telegram
 SESSIONS_FILE = Path(os.getenv("SESSIONS_FILE", "/workspace/.bot/sessions.json"))
 USER_PROMPTS_FILE = Path(os.getenv("USER_PROMPTS_FILE", "/workspace/.bot/user_prompts.json"))
 ERROR_REPORTS_DIR = Path(os.getenv("ERROR_REPORTS_DIR", "/workspace/.bot/errors"))
-DEFAULT_PROMPT = os.getenv(
-    "DEFAULT_PROMPT",
-    """
-При ответах используй ТОЛЬКО Telegram HTML-разметку:
-- Жирный: <b>текст</b>
-- Курсив: <i>текст</i>
-- Код: <code>текст</code>
-- Ссылки: <a href="url">текст</a>
-- Зачёркнутый: <s>текст</s>
-- Подчёркнутый: <u>текст</u>
-- Custom Emoji: <tg-emoji emoji-id="emoji_id">🤖</tg-emoji>
-  Внутри тега ОБЯЗАТЕЛЬНО должен быть настоящий эмодзи (по контексту) (🤖😀📂 и т.п.), НЕ цифра и НЕ число. Иначе Telegram вернёт ENTITY_TEXT_INVALID.
-
-НЕ используй Markdown: **жирный**, *курсив*, [текст](url), # заголовки, ## подзаголовки.
-НЕ используй tag ul и li.
----
-Тебе не нужен MCP чтобы писать сообщения в Telegram. То что ты ответишь автоматически будет отправлено как сообщение.
----
-Я иногда буду кидать тебе Custom Emoji и объяснять что он означает, сохраняй эту информацию в корне в файле .emojies
-Обращайся к файлу когда захочешь использовать Custom Emoji в ответе. Используй их почаще!
----
-Чтобы отправить пользователю файл, напиши в ответе строку:
-send_document::путь_к_файлу::имя_файла::подпись
-Эта строка будет удалена из сообщения, а файл отправлен отдельно.
-""",
-).strip()
+DEFAULT_PROMPT_FILE = Path(__file__).resolve().parent.parent / "default_prompt.txt"
 
 dp = Dispatcher()
 
@@ -81,6 +54,20 @@ _user_sessions: dict[int, bool] = {}
 _user_cwd: dict[int, Path] = {}
 # Пользовательские промпты: user_id -> str
 _user_prompts: dict[int, str] = {}
+
+
+def _get_unique_file_path(directory: Path, filename: str) -> Path:
+    """Возвращает уникальный путь для файла (добавляет _1, _2, ... при коллизии)."""
+    path = directory / filename
+    if not path.exists():
+        return path
+    stem, suffix = path.stem, path.suffix
+    i = 1
+    while True:
+        path = directory / f"{stem}_{i}{suffix}"
+        if not path.exists():
+            return path
+        i += 1
 
 
 def _get_user_cwd(user_id: int) -> Path:
@@ -133,33 +120,47 @@ def _parse_send_document(text: str) -> tuple[str, list[tuple[Path, str, str]]]:
     return remaining, docs
 
 
-async def _send_response(
-    status_msg: Message,
-    response: str,
+MSG_SPLIT_SEP = ";;;"
+
+
+def _split_response_messages(text: str) -> list[str]:
+    """Разбивает текст по ;;; на отдельные сообщения."""
+    parts = [p.strip() for p in text.split(MSG_SPLIT_SEP) if p.strip()]
+    return parts if parts else ["(пустой ответ)"]
+
+
+async def _send_one_message(
+    target: Message,
+    text: str,
     message: Message,
     bot: Bot,
-) -> None:
+    edit: bool = False,
+) -> bool:
     """
-    Отправляет ответ в Telegram. При ошибке (ENTITY_TEXT_INVALID и др.):
-    логирует, пишет в файл, отправляет файл пользователю и короткое сообщение.
+    Отправляет одно сообщение (edit или answer). При ошибке — логирует и отправляет отчёт.
+    Возвращает True при успехе.
     """
+    if len(text) > MAX_RESPONSE_LENGTH:
+        text = text[:MAX_RESPONSE_LENGTH] + "\n\n... (обрезано)"
     try:
-        if response.strip():
-            await status_msg.edit_text(response)
+        if edit:
+            await target.edit_text(text or "(пустой ответ)")
         else:
-            await status_msg.edit_text("(пустой ответ)")
+            await message.answer(text or "(пустой ответ)")
+        return True
     except TelegramBadRequest as e:
         err_name = type(e).__name__
         err_msg = str(e)
-        logger.error("Ошибка отправки %s, текст ответа: %s", err_name, response[:500])
+        logger.error("Ошибка отправки %s, текст: %s", err_name, text[:500])
         ERROR_REPORTS_DIR.mkdir(parents=True, exist_ok=True)
         ts = time.strftime("%Y%m%d_%H%M%S")
         update_id = getattr(message, "message_id", 0)
         report_path = ERROR_REPORTS_DIR / f"error_{ts}_{update_id}.txt"
-        content = f"Ошибка: {err_name}\n{err_msg}\n\n--- Текст ответа ---\n{response}\n\n--- Traceback ---\n{traceback.format_exc()}"
+        content = f"Ошибка: {err_name}\n{err_msg}\n\n--- Текст ---\n{text}\n\n--- Traceback ---\n{traceback.format_exc()}"
         report_path.write_text(content, encoding="utf-8")
         try:
-            await status_msg.edit_text(f"⛔ Ошибка отправки: {err_name}")
+            if edit:
+                await target.edit_text(f"⛔ Ошибка отправки: {err_name}")
             await bot.send_document(
                 chat_id=message.chat.id,
                 document=FSInputFile(report_path, filename=report_path.name),
@@ -167,12 +168,40 @@ async def _send_response(
             )
         except Exception as send_err:
             logger.exception("Не удалось отправить отчёт: %s", send_err)
+        return False
     except Exception as e:
-        logger.exception("Ошибка при edit_text: %s", e)
+        logger.exception("Ошибка при отправке: %s", e)
         try:
             await message.answer(f"⛔ Ошибка: {type(e).__name__}")
         except Exception:
             pass
+        return False
+
+
+async def _send_response(
+    status_msg: Message,
+    response: str,
+    message: Message,
+    bot: Bot,
+) -> None:
+    """
+    Отправляет ответ в Telegram. Поддерживает split по ;;; — несколько сообщений.
+    При ошибке (ENTITY_TEXT_INVALID и др.):
+    логирует, пишет в файл, отправляет файл пользователю и короткое сообщение.
+    """
+    parts = _split_response_messages(response)
+    for i, part in enumerate(parts):
+        is_first = i == 0
+        await _send_one_message(
+            status_msg,
+            part,
+            message,
+            bot,
+            edit=is_first,
+        )
+        if not is_first:
+            # Небольшая задержка между сообщениями (антифлуд)
+            await asyncio.sleep(0.3)
 
 
 def _load_sessions() -> None:
@@ -219,6 +248,29 @@ def _save_user_prompts() -> None:
         )
     except Exception as e:
         logger.warning("Не удалось сохранить user_prompts: %s", e)
+
+
+def _get_default_prompt() -> str:
+    """Загрузить глобальный промпт из файла или env."""
+    env_prompt = os.getenv("DEFAULT_PROMPT", "").strip()
+    if env_prompt:
+        return env_prompt
+    try:
+        if DEFAULT_PROMPT_FILE.exists():
+            return DEFAULT_PROMPT_FILE.read_text(encoding="utf-8").strip()
+    except Exception as e:
+        logger.warning("Не удалось загрузить default_prompt: %s", e)
+    return ""
+
+
+def _set_default_prompt(text: str) -> None:
+    """Сохранить глобальный промпт в файл."""
+    try:
+        DEFAULT_PROMPT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        DEFAULT_PROMPT_FILE.write_text(text.strip(), encoding="utf-8")
+    except Exception as e:
+        logger.warning("Не удалось сохранить default_prompt: %s", e)
+        raise
 
 
 def _get_user_prompt(user_id: int) -> str:
@@ -303,7 +355,7 @@ async def run_cursor_agent_streaming(
         cmd.append("--continue")
     cmd.extend(["--print", prompt])
 
-    last_status = "<tg-emoji emoji-id=\"5210764626857313664\">🤖</tg-emoji> Инициализация..."
+    last_status = '<tg-emoji emoji-id="5210764626857313664">🤖</tg-emoji> Инициализация...'
     last_edit_time = [0.0]  # mutable для доступа из вложенной функции
     STATUS_DEBOUNCE = 2.0  # секунд между обновлениями Telegram
     assistant_parts: list[str] = []
@@ -422,7 +474,9 @@ async def cmd_start(message: Message) -> None:
         "/help — справка\n"
         "/set_prompt — задать свой промпт для агента\n"
         "/myprompt — показать свой промпт\n"
-        "/clear_prompt — очистить свой промпт",
+        "/clear_prompt — очистить свой промпт\n"
+        "/get_global_prompt — показать глобальный промпт\n"
+        "/set_global_prompt — задать глобальный промпт",
     )
 
 
@@ -469,9 +523,9 @@ async def cmd_help(message: Message) -> None:
     await message.answer(
         "📖 *Справка*\n\n"
         "Просто напиши задачу на естественном языке, например:\n"
-        "• \"Найди баги в main.py\"\n"
-        "• \"Добавь обработку ошибок в api\"\n"
-        "• \"Объясни что делает функция parse\"\n\n"
+        '• "Найди баги в main.py"\n'
+        '• "Добавь обработку ошибок в api"\n'
+        '• "Объясни что делает функция parse"\n\n'
         "Системные команды: /cd, /pwd, /ls, /mkdir, /cat, /rm",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -523,6 +577,41 @@ async def cmd_clear_prompt(message: Message) -> None:
     await message.answer("🗑 Промпт очищен.")
 
 
+@dp.message(Command("get_global_prompt", "global_prompt"))
+async def cmd_get_global_prompt(message: Message) -> None:
+    """Команда /get_global_prompt — показать глобальный промпт."""
+    if not is_allowed(message.from_user.id):
+        await message.answer("⛔ Доступ запрещён.")
+        return
+
+    prompt = _get_default_prompt()
+    if not prompt:
+        await message.answer("Глобальный промпт пуст. Используй /set_global_prompt &lt;текст&gt;")
+        return
+
+    preview = prompt[:3500] + ("..." if len(prompt) > 3500 else "")
+    await message.answer(f"📋 <b>Глобальный промпт:</b>\n\n<pre>{html.escape(preview)}</pre>")
+
+
+@dp.message(Command("set_global_prompt"))
+async def cmd_set_global_prompt(message: Message, command: CommandObject) -> None:
+    """Команда /set_global_prompt <текст> — задать глобальный промпт для агента."""
+    if not is_allowed(message.from_user.id):
+        await message.answer("⛔ Доступ запрещён.")
+        return
+
+    if not command.args or not command.args.strip():
+        await message.answer("Использование: /set_global_prompt &lt;текст&gt;")
+        return
+
+    try:
+        _set_default_prompt(command.args.strip())
+        preview = command.args.strip()[:200] + ("..." if len(command.args.strip()) > 200 else "")
+        await message.answer(f"✅ Глобальный промпт сохранён:\n\n<pre>{html.escape(preview)}</pre>")
+    except Exception as e:
+        await message.answer(f"⛔ Ошибка сохранения: {e}")
+
+
 @dp.message(Command("cd"))
 async def cmd_cd(message: Message, command: CommandObject) -> None:
     """Команда /cd <путь> — сменить директорию."""
@@ -531,7 +620,9 @@ async def cmd_cd(message: Message, command: CommandObject) -> None:
         return
 
     if not command.args or not command.args.strip():
-        await message.answer(f"📂 Текущая: <code>{_get_user_cwd(message.from_user.id)}</code>\n\nИспользование: /cd &lt;путь&gt;")
+        await message.answer(
+            f"📂 Текущая: <code>{_get_user_cwd(message.from_user.id)}</code>\n\nИспользование: /cd &lt;путь&gt;"
+        )
         return
 
     path = _resolve_path(message.from_user.id, command.args.strip())
@@ -677,6 +768,67 @@ async def cmd_rm(message: Message, command: CommandObject) -> None:
         await message.answer(f"⛔ Ошибка: {e}")
 
 
+@dp.message(F.document)
+async def handle_document(message: Message) -> None:
+    """Сохранение документа в files/."""
+    if not is_allowed(message.from_user.id):
+        await message.answer("⛔ Доступ запрещён.")
+        return
+
+    doc = message.document
+    filename = doc.file_name or f"document_{doc.file_unique_id}"
+    FILES_DIR.mkdir(parents=True, exist_ok=True)
+    dest = _get_unique_file_path(FILES_DIR, filename)
+
+    try:
+        await message.bot.download(doc, destination=dest)
+        await message.answer(f"📥 Файл сохранён: <code>files/{dest.name}</code>")
+    except Exception as e:
+        logger.exception("Ошибка сохранения файла: %s", e)
+        await message.answer(f"⛔ Не удалось сохранить файл: {e}")
+
+
+@dp.message(F.photo)
+async def handle_photo(message: Message) -> None:
+    """Сохранение фото в files/ (берём фото максимального размера)."""
+    if not is_allowed(message.from_user.id):
+        await message.answer("⛔ Доступ запрещён.")
+        return
+
+    photo = message.photo[-1]  # наибольшее разрешение
+    ext = "jpg"  # Telegram отдаёт фото в JPEG
+    filename = f"photo_{photo.file_unique_id}.{ext}"
+    FILES_DIR.mkdir(parents=True, exist_ok=True)
+    dest = _get_unique_file_path(FILES_DIR, filename)
+
+    try:
+        await message.bot.download(photo, destination=dest)
+        await message.answer(f"📥 Фото сохранено: <code>files/{dest.name}</code>")
+    except Exception as e:
+        logger.exception("Ошибка сохранения фото: %s", e)
+        await message.answer(f"⛔ Не удалось сохранить фото: {e}")
+
+
+@dp.message(F.video)
+async def handle_video(message: Message) -> None:
+    """Сохранение видео в files/."""
+    if not is_allowed(message.from_user.id):
+        await message.answer("⛔ Доступ запрещён.")
+        return
+
+    video = message.video
+    filename = video.file_name or f"video_{video.file_unique_id}.mp4"
+    FILES_DIR.mkdir(parents=True, exist_ok=True)
+    dest = _get_unique_file_path(FILES_DIR, filename)
+
+    try:
+        await message.bot.download(video, destination=dest)
+        await message.answer(f"📥 Видео сохранено: <code>files/{dest.name}</code>")
+    except Exception as e:
+        logger.exception("Ошибка сохранения видео: %s", e)
+        await message.answer(f"⛔ Не удалось сохранить видео: {e}")
+
+
 @dp.message(F.text)
 async def handle_message(message: Message) -> None:
     """Обработка текстовых сообщений (не команд)."""
@@ -698,10 +850,11 @@ async def handle_message(message: Message) -> None:
     user_id = message.from_user.id
     continue_session = _get_session_active(user_id)
 
-    # При новом чате — единоразово добавляем DEFAULT_PROMPT
+    # При новом чате — единоразово добавляем глобальный промпт
     parts: list[str] = []
-    if not continue_session and DEFAULT_PROMPT:
-        parts.append(DEFAULT_PROMPT)
+    default_prompt = _get_default_prompt()
+    if not continue_session and default_prompt:
+        parts.append(default_prompt)
     # Пользовательский промпт добавляется всегда, если задан
     user_prompt = _get_user_prompt(user_id)
     if user_prompt:
@@ -709,7 +862,7 @@ async def handle_message(message: Message) -> None:
     parts.append(prompt)
     prompt = "\n\n".join(parts)
 
-    status_msg = await message.answer("<tg-emoji emoji-id=\"5210764626857313664\">🤖</tg-emoji> Инициализация...")
+    status_msg = await message.answer('<tg-emoji emoji-id="5210764626857313664">🤖</tg-emoji> Инициализация...')
 
     response, success = await run_cursor_agent_streaming(
         prompt,
@@ -747,6 +900,7 @@ async def main() -> None:
         logger.warning("ALLOWED_USER_IDS пуст — доступ для всех (не рекомендуется)")
 
     WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
+    FILES_DIR.mkdir(parents=True, exist_ok=True)
     _load_sessions()
     _load_user_prompts()
 
@@ -756,21 +910,25 @@ async def main() -> None:
     )
 
     # Меню команд (подсказки при вводе /)
-    await bot.set_my_commands([
-        BotCommand(command="start", description="Приветствие и твой ID"),
-        BotCommand(command="help", description="Справка по боту"),
-        BotCommand(command="new", description="Сбросить контекст чата"),
-        BotCommand(command="status", description="Проверка подключения"),
-        BotCommand(command="set_prompt", description="Задать свой промпт"),
-        BotCommand(command="myprompt", description="Показать свой промпт"),
-        BotCommand(command="clear_prompt", description="Очистить промпт"),
-        BotCommand(command="cd", description="Сменить директорию"),
-        BotCommand(command="pwd", description="Текущая директория"),
-        BotCommand(command="ls", description="Список файлов"),
-        BotCommand(command="mkdir", description="Создать директорию"),
-        BotCommand(command="cat", description="Показать файл"),
-        BotCommand(command="rm", description="Удалить файл/папку"),
-    ])
+    await bot.set_my_commands(
+        [
+            BotCommand(command="start", description="Приветствие и твой ID"),
+            BotCommand(command="help", description="Справка по боту"),
+            BotCommand(command="new", description="Сбросить контекст чата"),
+            BotCommand(command="status", description="Проверка подключения"),
+            BotCommand(command="set_prompt", description="Задать свой промпт"),
+            BotCommand(command="myprompt", description="Показать свой промпт"),
+            BotCommand(command="clear_prompt", description="Очистить промпт"),
+            BotCommand(command="get_global_prompt", description="Показать глобальный промпт"),
+            BotCommand(command="set_global_prompt", description="Задать глобальный промпт"),
+            BotCommand(command="cd", description="Сменить директорию"),
+            BotCommand(command="pwd", description="Текущая директория"),
+            BotCommand(command="ls", description="Список файлов"),
+            BotCommand(command="mkdir", description="Создать директорию"),
+            BotCommand(command="cat", description="Показать файл"),
+            BotCommand(command="rm", description="Удалить файл/папку"),
+        ]
+    )
 
     logger.info("Бот запущен")
     await dp.start_polling(bot)
