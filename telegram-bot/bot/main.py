@@ -1376,14 +1376,14 @@ def _build_photo_prompt(rel_path: str, abs_path: Path, caption: str) -> str:
     """Формирует промпт для агента по отправленному фото."""
     lines = [
         "[Пользователь отправил фото]",
-        f"Файл: {rel_path}",
-        f"Абсолютный путь: {abs_path}",
+        f"Изображение: @{abs_path}",
+        f"Файл в workspace: {rel_path}",
     ]
     if caption:
-        lines.append(f"Описание от пользователя: {caption}")
+        lines.append(f"Запрос пользователя: {caption}")
     else:
-        lines.append("Подпись к фото не указана.")
-    lines.append("Открой изображение по пути и ответь пользователю.")
+        lines.append("Запрос: опиши изображение и ответь пользователю.")
+    lines.append("Используй прикреплённое изображение (@...) как визуальный контекст.")
     return "\n".join(lines)
 
 
