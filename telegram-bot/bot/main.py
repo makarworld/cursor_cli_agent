@@ -12,6 +12,7 @@ import os
 import re
 import time
 import traceback
+from datetime import datetime
 from pathlib import Path
 
 from aiohttp import BasicAuth
@@ -31,6 +32,14 @@ from aiogram.types import (
 )
 from dotenv import load_dotenv
 
+from .scheduler import (
+    SCHEDULER_ENABLED,
+    cancel_event,
+    create_event,
+    format_event_line,
+    list_events,
+    start_scheduler,
+)
 from .self_modify import (
     SELF_MODIFY_AUTO_FIX,
     SELF_MODIFY_CODEWORDS,
@@ -194,6 +203,42 @@ def _resolve_path(user_id: int, path_str: str) -> Path | None:
     except ValueError:
         return None
     return path
+
+
+def _parse_schedule_reminders(
+    text: str,
+    user_id: int,
+    chat_id: int,
+) -> tuple[str, list[str]]:
+    """
+    Извлекает schedule_reminder::ISO_DATETIME::заголовок::контекст из текста агента.
+    Создаёт записи в БД. Возвращает (текст без директив, список подтверждений).
+    """
+    confirmations: list[str] = []
+    remaining = text
+    pattern = re.compile(r"schedule_reminder::([^\n]+)")
+
+    for m in pattern.finditer(text):
+        full = m.group(0)
+        rest = m.group(1)
+        parts = rest.split("::", 2)
+        if len(parts) < 2:
+            remaining = remaining.replace(full, "")
+            continue
+        dt_str, title = parts[0].strip(), parts[1].strip()
+        body = parts[2].strip() if len(parts) > 2 else ""
+        try:
+            remind_at = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+            event = create_event(user_id, chat_id, title, remind_at, body)
+            at_fmt = event.remind_at.strftime("%d.%m.%Y %H:%M UTC")
+            confirmations.append(f"⏰ Напоминание #{event.id} на {at_fmt}: {title}")
+        except Exception as e:
+            logger.warning("Не удалось создать напоминание: %s — %s", rest[:80], e)
+            confirmations.append(f"⛔ Не удалось запланировать: {title or dt_str} ({e})")
+        remaining = remaining.replace(full, "")
+
+    remaining = re.sub(r"\n{3,}", "\n\n", remaining.strip())
+    return remaining, confirmations
 
 
 def _parse_send_document(text: str) -> tuple[str, list[tuple[Path, str, str]]]:
@@ -479,6 +524,40 @@ async def _send_one_message(
         return False
 
 
+async def _deliver_agent_text(bot: Bot, chat_id: int, response: str) -> None:
+    """Отправляет текст агента в чат (напоминания, проактивные уведомления)."""
+    remaining_text, send_docs = _parse_send_document(response)
+    for path, name, caption in send_docs:
+        try:
+            p = Path(path)
+            if p.is_file():
+                await bot.send_document(
+                    chat_id=chat_id,
+                    document=FSInputFile(p, filename=name),
+                    caption=caption or None,
+                )
+        except Exception as e:
+            logger.warning("Не удалось отправить файл %s: %s", path, e)
+
+    parts = _split_response_messages(remaining_text)
+    for i, part in enumerate(parts):
+        clean_part, button_rows = _parse_inline_buttons(part)
+        reply_markup = _build_inline_markup(button_rows)
+        text = clean_part
+        if len(text) > MAX_RESPONSE_LENGTH:
+            text = text[:MAX_RESPONSE_LENGTH] + "\n\n... (обрезано)"
+        text = _balance_html_tags(text or "(пустой ответ)")
+        try:
+            await bot.send_message(chat_id, text, reply_markup=reply_markup)
+        except TelegramBadRequest:
+            try:
+                await bot.send_message(chat_id, _strip_html_tags(text), parse_mode=None)
+            except Exception as e:
+                logger.error("Не удалось отправить проактивное сообщение: %s", e)
+        if i < len(parts) - 1:
+            await asyncio.sleep(0.3)
+
+
 async def _send_response(
     status_msg: Message,
     response: str,
@@ -639,7 +718,7 @@ async def run_cursor_agent_streaming(
     prompt: str,
     cwd: Path,
     continue_session: bool,
-    status_msg: Message,
+    status_msg: Message | None = None,
 ) -> tuple[str, bool]:
     """
     Запускает cursor-agent со stream-json, обновляет status_msg по ходу выполнения.
@@ -693,13 +772,14 @@ async def run_cursor_agent_streaming(
                 status = _parse_stream_status(line)
                 if status:
                     last_status = status
-                    now = time.monotonic()
-                    if now - last_edit_time[0] >= STATUS_DEBOUNCE:
-                        try:
-                            await status_msg.edit_text(f"⏳ {last_status}", parse_mode=None)
-                            last_edit_time[0] = now
-                        except Exception:
-                            pass
+                    if status_msg is not None:
+                        now = time.monotonic()
+                        if now - last_edit_time[0] >= STATUS_DEBOUNCE:
+                            try:
+                                await status_msg.edit_text(f"⏳ {last_status}", parse_mode=None)
+                                last_edit_time[0] = now
+                            except Exception:
+                                pass
                 try:
                     data = json.loads(line)
                     if data.get("type") == "assistant":
@@ -915,7 +995,9 @@ async def cmd_start(message: Message) -> None:
         "/self_fix [описание] — попросить бота исправить свой код\n"
         "/bot_git_status — статус git (изменения бота)\n"
         "/bot_git_log — последние коммиты бота\n"
-        "/bot_rollback — откатить последний коммит бота",
+        "/bot_rollback — откатить последний коммит бота\n"
+        "/reminders — список запланированных напоминаний\n"
+        "/cancel_reminder &lt;id&gt; — отменить напоминание",
     )
 
 
@@ -941,7 +1023,8 @@ async def cmd_status(message: Message) -> None:
         f"Git-репозиторий: {git_ok}\n"
         f"Автофикс ошибок: {'✅' if SELF_MODIFY_AUTO_FIX else '❌'}\n"
         f"Кодовое слово: {'✅ обязательно' if codeword_required() else '❌ выкл'} "
-        f"({', '.join(SELF_MODIFY_CODEWORDS)})",
+        f"({', '.join(SELF_MODIFY_CODEWORDS)})\n"
+        f"Планировщик: {'✅' if SCHEDULER_ENABLED else '❌'}",
     )
 
 
@@ -976,7 +1059,10 @@ async def cmd_help(message: Message) -> None:
         "/self_fix [описание] — принудительное самоисправление (без кодового слова)\n"
         "/bot_git_status — изменения в git\n"
         "/bot_git_log — история коммитов\n"
-        "/bot_rollback [N] — откат N коммитов",
+        "/bot_rollback [N] — откат N коммитов\n\n"
+        "Напоминания: просто напиши «напомни мне завтра в 10 про ...» — "
+        "я сохраню в БД и пришлю вовремя.\n"
+        "/reminders — список, /cancel_reminder &lt;id&gt; — отмена",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -1020,6 +1106,54 @@ async def cmd_bot_git_log(message: Message, command: CommandObject) -> None:
     if command.args and command.args.strip().isdigit():
         limit = min(int(command.args.strip()), 30)
     await message.answer(f"<pre>{html.escape(git_log(limit))}</pre>")
+
+
+@dp.message(Command("reminders"))
+async def cmd_reminders(message: Message) -> None:
+    """Список запланированных напоминаний."""
+    if not is_allowed(message.from_user.id):
+        await message.answer("⛔ Доступ запрещён.")
+        return
+    if not SCHEDULER_ENABLED:
+        await message.answer("⛔ Планировщик отключён.")
+        return
+
+    events = list_events(message.from_user.id)
+    if not events:
+        await message.answer(
+            "📭 Нет активных напоминаний.\n\n"
+            "Напиши, например: «напомни мне завтра в 10:00 проверить деплой»"
+        )
+        return
+
+    lines = [format_event_line(e, escape_html=html.escape) for e in events]
+    await message.answer(
+        "⏰ <b>Запланированные напоминания</b>\n\n" + "\n".join(lines)
+    )
+
+
+@dp.message(Command("cancel_reminder"))
+async def cmd_cancel_reminder(message: Message, command: CommandObject) -> None:
+    """Отмена напоминания по ID."""
+    if not is_allowed(message.from_user.id):
+        await message.answer("⛔ Доступ запрещён.")
+        return
+    if not SCHEDULER_ENABLED:
+        await message.answer("⛔ Планировщик отключён.")
+        return
+
+    args = (command.args or "").strip()
+    if not args or not args.split()[0].isdigit():
+        await message.answer("Использование: /cancel_reminder &lt;id&gt;\nСписок: /reminders")
+        return
+
+    event_id = int(args.split()[0])
+    if cancel_event(event_id, message.from_user.id):
+        await message.answer(f"🗑 Напоминание <code>#{event_id}</code> отменено.")
+    else:
+        await message.answer(
+            f"⛔ Напоминание <code>#{event_id}</code> не найдено или уже сработало."
+        )
 
 
 @dp.message(Command("bot_rollback"))
@@ -1337,7 +1471,10 @@ async def _run_agent_for_user(
     if success:
         _set_session_active(user_id, True)
 
-    remaining_text, send_docs = _parse_send_document(response)
+    remaining_text, schedule_notes = _parse_schedule_reminders(
+        response, user_id, message.chat.id
+    )
+    remaining_text, send_docs = _parse_send_document(remaining_text)
     bot = message.bot
     for path, name, caption in send_docs:
         resolved = _resolve_path(user_id, str(path))
@@ -1351,10 +1488,24 @@ async def _run_agent_for_user(
                 logger.warning("Не удалось отправить файл %s: %s", path, e)
                 remaining_text = f"⛔ Не удалось отправить файл: {path}\n\n{remaining_text}"
 
-    await _send_response(status_msg, remaining_text or "(пустой ответ)", message, bot)
+    final_text = remaining_text or "(пустой ответ)"
+    if schedule_notes:
+        notes_block = "\n".join(schedule_notes)
+        final_text = f"{final_text}\n\n{notes_block}" if final_text != "(пустой ответ)" else notes_block
+    await _send_response(status_msg, final_text, message, bot)
 
     if success:
         await _finalize_bot_changes(response, user_text, status_msg, message)
+
+
+async def _run_headless_agent(prompt: str) -> tuple[str, bool]:
+    """Запускает cursor-agent без Telegram-статуса (для планировщика)."""
+    return await run_cursor_agent_streaming(
+        prompt,
+        WORKSPACE_DIR,
+        continue_session=False,
+        status_msg=None,
+    )
 
 
 async def _save_telegram_photo(message: Message) -> tuple[Path, str] | None:
@@ -1558,6 +1709,8 @@ async def main() -> None:
             BotCommand(command="bot_git_status", description="Git-статус бота"),
             BotCommand(command="bot_git_log", description="Коммиты бота"),
             BotCommand(command="bot_rollback", description="Откат коммита бота"),
+            BotCommand(command="reminders", description="Список напоминаний"),
+            BotCommand(command="cancel_reminder", description="Отменить напоминание"),
         ]
     )
 
@@ -1568,6 +1721,7 @@ async def main() -> None:
             SELF_MODIFY_AUTO_FIX,
         )
     await _notify_after_restart(bot)
+    start_scheduler(bot, _run_headless_agent, _deliver_agent_text)
     logger.info("Бот запущен")
     try:
         await dp.start_polling(bot)
