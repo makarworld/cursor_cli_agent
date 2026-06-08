@@ -1289,6 +1289,104 @@ async def cmd_rm(message: Message, command: CommandObject) -> None:
         await message.answer(f"⛔ Ошибка: {e}")
 
 
+def _build_agent_prompt(user_id: int, user_text: str, prompt_body: str) -> tuple[str, Path]:
+    """Собирает полный промпт и рабочую директорию для cursor-agent."""
+    continue_session = _get_session_active(user_id)
+    parts: list[str] = []
+    default_prompt = _get_default_prompt()
+    if not continue_session and default_prompt:
+        parts.append(default_prompt)
+    user_prompt = _get_user_prompt(user_id)
+    if user_prompt:
+        parts.append(f"[Информация от пользователя]\n{user_prompt}\n[/Информация от пользователя]")
+    codeword_guard = build_codeword_guard_prompt(user_text)
+    if codeword_guard:
+        parts.append(codeword_guard)
+    parts.append(prompt_body)
+    prompt = "\n\n".join(parts)
+
+    agent_cwd = _get_user_cwd(user_id)
+    if self_modify_enabled() and codeword_required() and has_codeword(user_text):
+        repo = Path(os.getenv("BOT_REPO_DIR", "/workspace/cursor_cli_agent"))
+        if repo.is_dir():
+            agent_cwd = repo
+    return prompt, agent_cwd
+
+
+async def _run_agent_for_user(
+    message: Message,
+    prompt_body: str,
+    user_text: str,
+) -> None:
+    """Запускает cursor-agent и отправляет ответ пользователю."""
+    user_id = message.from_user.id
+    continue_session = _get_session_active(user_id)
+    prompt, agent_cwd = _build_agent_prompt(user_id, user_text, prompt_body)
+
+    status_msg = await message.answer(
+        '<tg-emoji emoji-id="5210764626857313664">🤖</tg-emoji> Инициализация...'
+    )
+
+    response, success = await run_cursor_agent_streaming(
+        prompt,
+        agent_cwd,
+        continue_session,
+        status_msg,
+    )
+
+    if success:
+        _set_session_active(user_id, True)
+
+    remaining_text, send_docs = _parse_send_document(response)
+    bot = message.bot
+    for path, name, caption in send_docs:
+        resolved = _resolve_path(user_id, str(path))
+        if resolved and resolved.is_file():
+            try:
+                await message.answer_document(
+                    FSInputFile(resolved, filename=name),
+                    caption=caption or None,
+                )
+            except Exception as e:
+                logger.warning("Не удалось отправить файл %s: %s", path, e)
+                remaining_text = f"⛔ Не удалось отправить файл: {path}\n\n{remaining_text}"
+
+    await _send_response(status_msg, remaining_text or "(пустой ответ)", message, bot)
+
+    if success:
+        await _finalize_bot_changes(response, user_text, status_msg, message)
+
+
+async def _save_telegram_photo(message: Message) -> tuple[Path, str] | None:
+    """Сохраняет фото в files/. Возвращает (абсолютный путь, files/имя) или None."""
+    photo = message.photo[-1]
+    filename = f"photo_{photo.file_unique_id}.jpg"
+    FILES_DIR.mkdir(parents=True, exist_ok=True)
+    dest = _get_unique_file_path(FILES_DIR, filename)
+    try:
+        await message.bot.download(photo, destination=dest)
+        return dest, f"files/{dest.name}"
+    except Exception as e:
+        logger.exception("Ошибка сохранения фото: %s", e)
+        await message.answer(f"⛔ Не удалось сохранить фото: {e}")
+        return None
+
+
+def _build_photo_prompt(rel_path: str, abs_path: Path, caption: str) -> str:
+    """Формирует промпт для агента по отправленному фото."""
+    lines = [
+        "[Пользователь отправил фото]",
+        f"Файл: {rel_path}",
+        f"Абсолютный путь: {abs_path}",
+    ]
+    if caption:
+        lines.append(f"Описание от пользователя: {caption}")
+    else:
+        lines.append("Подпись к фото не указана.")
+    lines.append("Открой изображение по пути и ответь пользователю.")
+    return "\n".join(lines)
+
+
 @dp.message(F.document)
 async def handle_document(message: Message) -> None:
     """Сохранение документа в files/."""
@@ -1311,23 +1409,20 @@ async def handle_document(message: Message) -> None:
 
 @dp.message(F.photo)
 async def handle_photo(message: Message) -> None:
-    """Сохранение фото в files/ (берём фото максимального размера)."""
+    """Сохраняет фото в files/ и сразу передаёт агенту с описанием."""
     if not is_allowed(message.from_user.id):
         await message.answer("⛔ Доступ запрещён.")
         return
 
-    photo = message.photo[-1]  # наибольшее разрешение
-    ext = "jpg"  # Telegram отдаёт фото в JPEG
-    filename = f"photo_{photo.file_unique_id}.{ext}"
-    FILES_DIR.mkdir(parents=True, exist_ok=True)
-    dest = _get_unique_file_path(FILES_DIR, filename)
+    saved = await _save_telegram_photo(message)
+    if not saved:
+        return
 
-    try:
-        await message.bot.download(photo, destination=dest)
-        await message.answer(f"📥 Фото сохранено: <code>files/{dest.name}</code>")
-    except Exception as e:
-        logger.exception("Ошибка сохранения фото: %s", e)
-        await message.answer(f"⛔ Не удалось сохранить фото: {e}")
+    dest, rel_path = saved
+    caption = (message.caption or "").strip()
+    user_text = caption if caption else f"[фото] {rel_path}"
+    prompt_body = _build_photo_prompt(rel_path, dest, caption)
+    await _run_agent_for_user(message, prompt_body, user_text)
 
 
 @dp.message(F.video)
@@ -1364,66 +1459,12 @@ async def handle_message(message: Message) -> None:
         await message.answer("⛔ Доступ запрещён.")
         return
 
-    prompt = message.html_text.strip()
-    if not prompt:
+    prompt_body = message.html_text.strip()
+    if not prompt_body:
         return
 
-    user_id = message.from_user.id
-    continue_session = _get_session_active(user_id)
     user_text = message.text.strip()
-
-    # При новом чате — единоразово добавляем глобальный промпт
-    parts: list[str] = []
-    default_prompt = _get_default_prompt()
-    if not continue_session and default_prompt:
-        parts.append(default_prompt)
-    # Пользовательский промпт добавляется всегда, если задан
-    user_prompt = _get_user_prompt(user_id)
-    if user_prompt:
-        parts.append(f"[Информация от пользователя]\n{user_prompt}\n[/Информация от пользователя]")
-    codeword_guard = build_codeword_guard_prompt(user_text)
-    if codeword_guard:
-        parts.append(codeword_guard)
-    parts.append(prompt)
-    prompt = "\n\n".join(parts)
-
-    # Для самомодификации агенту удобнее корень репозитория
-    agent_cwd = _get_user_cwd(user_id)
-    if self_modify_enabled() and codeword_required() and has_codeword(user_text):
-        repo = Path(os.getenv("BOT_REPO_DIR", "/workspace/cursor_cli_agent"))
-        if repo.is_dir():
-            agent_cwd = repo
-
-    status_msg = await message.answer('<tg-emoji emoji-id="5210764626857313664">🤖</tg-emoji> Инициализация...')
-
-    response, success = await run_cursor_agent_streaming(
-        prompt,
-        agent_cwd,
-        continue_session,
-        status_msg,
-    )
-
-    if success:
-        _set_session_active(user_id, True)
-
-    remaining_text, send_docs = _parse_send_document(response)
-    bot = message.bot
-    for path, name, caption in send_docs:
-        resolved = _resolve_path(user_id, str(path))
-        if resolved and resolved.is_file():
-            try:
-                await message.answer_document(
-                    FSInputFile(resolved, filename=name),
-                    caption=caption or None,
-                )
-            except Exception as e:
-                logger.warning("Не удалось отправить файл %s: %s", path, e)
-                remaining_text = f"⛔ Не удалось отправить файл: {path}\n\n{remaining_text}"
-
-    await _send_response(status_msg, remaining_text or "(пустой ответ)", message, bot)
-
-    if success:
-        await _finalize_bot_changes(response, user_text, status_msg, message)
+    await _run_agent_for_user(message, prompt_body, user_text)
 
 
 @dp.errors()
