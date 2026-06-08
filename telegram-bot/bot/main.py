@@ -12,7 +12,7 @@ import os
 import re
 import time
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from aiohttp import BasicAuth
@@ -214,6 +214,9 @@ def _parse_schedule_reminders(
     Извлекает schedule_reminder::ISO_DATETIME::заголовок::контекст из текста агента.
     Создаёт записи в БД. Возвращает (текст без директив, список подтверждений).
     """
+    if not SCHEDULER_ENABLED:
+        return text, []
+
     confirmations: list[str] = []
     remaining = text
     pattern = re.compile(r"schedule_reminder::([^\n]+)")
@@ -239,6 +242,55 @@ def _parse_schedule_reminders(
 
     remaining = re.sub(r"\n{3,}", "\n\n", remaining.strip())
     return remaining, confirmations
+
+
+def _parse_remind_args(args: str) -> tuple[datetime, str] | None:
+    """
+    Парсит аргументы /remind:
+    +30m текст | +2h текст | +1d текст
+    2025-06-09 10:00 текст | 2025-06-09T10:00 текст
+    09.06.2025 10:00 текст
+    """
+    text = args.strip()
+    if not text:
+        return None
+
+    rel = re.match(r"^\+(\d+)([mhdMHD])\s+(.+)$", text, re.DOTALL)
+    if rel:
+        amount, unit, title = int(rel.group(1)), rel.group(2).lower(), rel.group(3).strip()
+        if not title:
+            return None
+        delta = {"m": timedelta(minutes=amount), "h": timedelta(hours=amount), "d": timedelta(days=amount)}
+        if unit not in delta:
+            return None
+        return datetime.now(timezone.utc).replace(tzinfo=None) + delta[unit], title
+
+    iso = re.match(
+        r"^(\d{4}-\d{2}-\d{2}[T ]\d{1,2}:\d{2}(?::\d{2})?)\s+(.+)$",
+        text,
+        re.DOTALL,
+    )
+    if iso:
+        dt_str, title = iso.group(1).replace(" ", "T"), iso.group(2).strip()
+        if not title:
+            return None
+        try:
+            return datetime.fromisoformat(dt_str), title
+        except ValueError:
+            return None
+
+    dmy = re.match(r"^(\d{2}\.\d{2}\.\d{4})\s+(\d{1,2}:\d{2}(?::\d{2})?)\s+(.+)$", text, re.DOTALL)
+    if dmy:
+        date_part, time_part, title = dmy.group(1), dmy.group(2), dmy.group(3).strip()
+        if not title:
+            return None
+        try:
+            fmt = "%d.%m.%Y %H:%M:%S" if time_part.count(":") == 2 else "%d.%m.%Y %H:%M"
+            return datetime.strptime(f"{date_part} {time_part}", fmt), title
+        except ValueError:
+            return None
+
+    return None
 
 
 def _parse_send_document(text: str) -> tuple[str, list[tuple[Path, str, str]]]:
@@ -996,6 +1048,7 @@ async def cmd_start(message: Message) -> None:
         "/bot_git_status — статус git (изменения бота)\n"
         "/bot_git_log — последние коммиты бота\n"
         "/bot_rollback — откатить последний коммит бота\n"
+        "/remind &lt;когда&gt; &lt;текст&gt; — напоминание напрямую\n"
         "/reminders — список запланированных напоминаний\n"
         "/cancel_reminder &lt;id&gt; — отменить напоминание",
     )
@@ -1060,8 +1113,8 @@ async def cmd_help(message: Message) -> None:
         "/bot_git_status — изменения в git\n"
         "/bot_git_log — история коммитов\n"
         "/bot_rollback [N] — откат N коммитов\n\n"
-        "Напоминания: просто напиши «напомни мне завтра в 10 про ...» — "
-        "я сохраню в БД и пришлю вовремя.\n"
+        "Напоминания: «напомни мне завтра в 10 про ...» или команда /remind.\n"
+        "Примеры: /remind +30m выпить воды | /remind 2025-06-09 10:00 деплой\n"
         "/reminders — список, /cancel_reminder &lt;id&gt; — отмена",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -1106,6 +1159,40 @@ async def cmd_bot_git_log(message: Message, command: CommandObject) -> None:
     if command.args and command.args.strip().isdigit():
         limit = min(int(command.args.strip()), 30)
     await message.answer(f"<pre>{html.escape(git_log(limit))}</pre>")
+
+
+@dp.message(Command("remind"))
+async def cmd_remind(message: Message, command: CommandObject) -> None:
+    """Команда /remind — создать напоминание без агента."""
+    if not is_allowed(message.from_user.id):
+        await message.answer("⛔ Доступ запрещён.")
+        return
+    if not SCHEDULER_ENABLED:
+        await message.answer("⛔ Планировщик отключён.")
+        return
+
+    args = (command.args or "").strip()
+    parsed = _parse_remind_args(args)
+    if not parsed:
+        await message.answer(
+            "Использование:\n"
+            "<code>/remind +30m текст</code>\n"
+            "<code>/remind +2h текст</code>\n"
+            "<code>/remind 2025-06-09 10:00 текст</code>\n"
+            "<code>/remind 09.06.2025 10:00 текст</code>\n\n"
+            "Время — UTC. Или просто напиши «напомни мне ...»"
+        )
+        return
+
+    remind_at, title = parsed
+    try:
+        event = create_event(message.from_user.id, message.chat.id, title, remind_at)
+        at_fmt = event.remind_at.strftime("%d.%m.%Y %H:%M UTC")
+        await message.answer(
+            f"⏰ Напоминание <code>#{event.id}</code> на {at_fmt}:\n{html.escape(title)}"
+        )
+    except Exception as e:
+        await message.answer(f"⛔ Не удалось создать: {html.escape(str(e))}")
 
 
 @dp.message(Command("reminders"))
@@ -1498,10 +1585,19 @@ async def _run_agent_for_user(
         await _finalize_bot_changes(response, user_text, status_msg, message)
 
 
-async def _run_headless_agent(prompt: str) -> tuple[str, bool]:
+async def _run_headless_agent(prompt: str, user_id: int) -> tuple[str, bool]:
     """Запускает cursor-agent без Telegram-статуса (для планировщика)."""
+    parts: list[str] = []
+    default_prompt = _get_default_prompt()
+    if default_prompt:
+        parts.append(default_prompt)
+    user_prompt = _get_user_prompt(user_id)
+    if user_prompt:
+        parts.append(f"[Информация от пользователя]\n{user_prompt}\n[/Информация от пользователя]")
+    parts.append(prompt)
+    full_prompt = "\n\n".join(parts)
     return await run_cursor_agent_streaming(
-        prompt,
+        full_prompt,
         WORKSPACE_DIR,
         continue_session=False,
         status_msg=None,
@@ -1709,6 +1805,7 @@ async def main() -> None:
             BotCommand(command="bot_git_status", description="Git-статус бота"),
             BotCommand(command="bot_git_log", description="Коммиты бота"),
             BotCommand(command="bot_rollback", description="Откат коммита бота"),
+            BotCommand(command="remind", description="Создать напоминание"),
             BotCommand(command="reminders", description="Список напоминаний"),
             BotCommand(command="cancel_reminder", description="Отменить напоминание"),
         ]

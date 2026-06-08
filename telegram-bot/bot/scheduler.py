@@ -67,13 +67,24 @@ def _normalize_dt(value: datetime) -> datetime:
     return value
 
 
+_db_initialized = False
+
+
 def init_db() -> None:
     """Инициализирует SQLite и создаёт таблицы."""
+    global _db_initialized
     SCHEDULER_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     _db.init(str(SCHEDULER_DB_PATH))
     _db.connect(reuse_if_open=True)
     _db.create_tables([ScheduledEvent], safe=True)
+    _db_initialized = True
     logger.info("Планировщик: БД %s", SCHEDULER_DB_PATH)
+
+
+def ensure_db() -> None:
+    """Гарантирует, что БД инициализирована (для создания напоминаний из чата)."""
+    if not _db_initialized:
+        init_db()
 
 
 def close_db() -> None:
@@ -89,6 +100,7 @@ def create_event(
     body: str = "",
 ) -> ScheduledEvent:
     """Создаёт новое напоминание."""
+    ensure_db()
     title = title.strip()
     if not title:
         raise ValueError("Пустой заголовок напоминания")
@@ -190,12 +202,12 @@ def build_reminder_prompt(event: ScheduledEvent) -> str:
 async def _process_one_event(
     bot: Bot,
     event: ScheduledEvent,
-    run_agent: Callable[[str], Awaitable[tuple[str, bool]]],
+    run_agent: Callable[[str, int], Awaitable[tuple[str, bool]]],
     deliver: Callable[[int, str], Awaitable[None]],
 ) -> None:
     """Обрабатывает одно сработавшее напоминание."""
     prompt = build_reminder_prompt(event)
-    response, success = await run_agent(prompt)
+    response, success = await run_agent(prompt, event.user_id)
     if not success:
         logger.warning("Агент не смог сгенерировать напоминание id=%s: %s", event.id, response[:200])
         return
@@ -210,7 +222,7 @@ async def _process_one_event(
 
 async def _scheduler_tick(
     bot: Bot,
-    run_agent: Callable[[str], Awaitable[tuple[str, bool]]],
+    run_agent: Callable[[str, int], Awaitable[tuple[str, bool]]],
     deliver: Callable[[int, str], Awaitable[None]],
 ) -> None:
     """Одна итерация проверки БД."""
@@ -225,7 +237,7 @@ async def _scheduler_tick(
 
 async def scheduler_loop(
     bot: Bot,
-    run_agent: Callable[[str], Awaitable[tuple[str, bool]]],
+    run_agent: Callable[[str, int], Awaitable[tuple[str, bool]]],
     deliver: Callable[[int, str], Awaitable[None]],
 ) -> None:
     """Фоновый цикл проверки напоминаний."""
@@ -244,7 +256,7 @@ async def scheduler_loop(
 
 def start_scheduler(
     bot: Bot,
-    run_agent: Callable[[str], Awaitable[tuple[str, bool]]],
+    run_agent: Callable[[str, int], Awaitable[tuple[str, bool]]],
     deliver: Callable[[int, str], Awaitable[None]],
 ) -> asyncio.Task | None:
     """Запускает фоновую задачу планировщика."""
