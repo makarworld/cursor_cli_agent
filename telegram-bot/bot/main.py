@@ -247,6 +247,113 @@ def _build_inline_markup(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMar
 
 
 MSG_SPLIT_SEP = ";;;"
+_TELEGRAM_HTML_TAGS = frozenset(
+    {"b", "i", "u", "s", "code", "pre", "a", "blockquote", "tg-emoji", "span", "em", "strong"}
+)
+_VOID_HTML_TAGS = frozenset({"br", "hr", "img"})
+
+
+def _html_tag_name(raw: str) -> str | None:
+    """Имя тега из содержимого <...> или None."""
+    raw = raw.strip()
+    if not raw or raw.startswith("!"):
+        return None
+    if raw.startswith("/"):
+        raw = raw[1:].strip()
+    name = raw.split(None, 1)[0].lower().rstrip("/")
+    if name in _VOID_HTML_TAGS or raw.endswith("/"):
+        return None
+    return name or None
+
+
+def _balance_html_tags(text: str) -> str:
+    """Закрывает незакрытые Telegram HTML-теги в фрагменте."""
+    open_stack: list[str] = []
+    parts: list[str] = []
+    i = 0
+    while i < len(text):
+        if text[i] != "<":
+            parts.append(text[i])
+            i += 1
+            continue
+        end = text.find(">", i)
+        if end == -1:
+            parts.append(text[i:])
+            break
+        tag_chunk = text[i : end + 1]
+        parts.append(tag_chunk)
+        inner = text[i + 1 : end]
+        if inner.startswith("/"):
+            name = _html_tag_name(inner)
+            if name and open_stack and open_stack[-1] == name:
+                open_stack.pop()
+        else:
+            name = _html_tag_name(inner)
+            if name and (name in _TELEGRAM_HTML_TAGS or name.startswith("tg-")):
+                open_stack.append(name)
+        i = end + 1
+    for name in reversed(open_stack):
+        parts.append(f"</{name}>")
+    return "".join(parts)
+
+
+def _strip_html_tags(text: str) -> str:
+    """Убирает HTML-теги, оставляет текст."""
+    return re.sub(r"<[^>]*>", "", text)
+
+
+def _split_response_messages(text: str) -> list[str]:
+    """
+    Разбивает текст по ;;; на отдельные сообщения.
+    Не режет внутри HTML-тегов — иначе Telegram падает на незакрытом <code> и т.п.
+    """
+    if MSG_SPLIT_SEP not in text:
+        stripped = text.strip()
+        return [stripped] if stripped else ["(пустой ответ)"]
+
+    parts: list[str] = []
+    current: list[str] = []
+    open_tags: list[str] = []
+    i = 0
+    length = len(text)
+
+    while i < length:
+        if text.startswith(MSG_SPLIT_SEP, i) and not open_tags:
+            chunk = "".join(current).strip()
+            if chunk:
+                parts.append(_balance_html_tags(chunk))
+            current = []
+            i += len(MSG_SPLIT_SEP)
+            continue
+
+        if text[i] == "<":
+            end = text.find(">", i)
+            if end == -1:
+                current.append(text[i])
+                i += 1
+                continue
+            tag_chunk = text[i : end + 1]
+            current.append(tag_chunk)
+            inner = text[i + 1 : end]
+            if inner.startswith("/"):
+                name = _html_tag_name(inner)
+                if name and open_tags and open_tags[-1] == name:
+                    open_tags.pop()
+            else:
+                name = _html_tag_name(inner)
+                if name and (name in _TELEGRAM_HTML_TAGS or name.startswith("tg-")):
+                    open_tags.append(name)
+            i = end + 1
+            continue
+
+        current.append(text[i])
+        i += 1
+
+    chunk = "".join(current).strip()
+    if chunk:
+        parts.append(_balance_html_tags(chunk))
+
+    return parts if parts else ["(пустой ответ)"]
 
 
 def _sanitize_prompt_for_cli(text: str) -> str:
@@ -263,12 +370,6 @@ def _sanitize_prompt_for_cli(text: str) -> str:
     return "\n".join(lines)
 
 
-def _split_response_messages(text: str) -> list[str]:
-    """Разбивает текст по ;;; на отдельные сообщения."""
-    parts = [p.strip() for p in text.split(MSG_SPLIT_SEP) if p.strip()]
-    return parts if parts else ["(пустой ответ)"]
-
-
 async def _send_one_message(
     target: Message,
     text: str,
@@ -283,21 +384,39 @@ async def _send_one_message(
     """
     if len(text) > MAX_RESPONSE_LENGTH:
         text = text[:MAX_RESPONSE_LENGTH] + "\n\n... (обрезано)"
-    try:
+    text = _balance_html_tags(text or "(пустой ответ)")
+
+    async def _do_send(body: str, *, use_html: bool = True) -> None:
+        kwargs: dict = {}
+        if reply_markup is not None:
+            kwargs["reply_markup"] = reply_markup
+        if not use_html:
+            kwargs["parse_mode"] = None
         if edit:
-            await target.edit_text(
-                text or "(пустой ответ)",
-                reply_markup=reply_markup,
-            )
+            await target.edit_text(body, **kwargs)
         else:
-            await message.answer(
-                text or "(пустой ответ)",
-                reply_markup=reply_markup,
-            )
+            await message.answer(body, **kwargs)
+
+    try:
+        await _do_send(text)
         return True
     except TelegramBadRequest as e:
+        err_msg = str(e).lower()
+        if "parse entities" in err_msg or "can't parse" in err_msg:
+            fixed = _balance_html_tags(text)
+            if fixed != text:
+                try:
+                    await _do_send(fixed)
+                    return True
+                except TelegramBadRequest:
+                    pass
+            try:
+                await _do_send(_strip_html_tags(text), use_html=False)
+                return True
+            except TelegramBadRequest:
+                pass
+
         err_name = type(e).__name__
-        err_msg = str(e)
         logger.error("Ошибка отправки %s, текст: %s", err_name, text[:500])
         ERROR_REPORTS_DIR.mkdir(parents=True, exist_ok=True)
         ts = time.strftime("%Y%m%d_%H%M%S")
