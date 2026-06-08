@@ -32,6 +32,7 @@ from aiogram.types import (
 )
 from dotenv import load_dotenv
 
+from .batch_middleware import MessageBatchMiddleware, setup_message_batch
 from .scheduler import (
     SCHEDULER_ENABLED,
     cancel_event,
@@ -1656,7 +1657,7 @@ async def handle_document(message: Message) -> None:
 
 @dp.message(F.photo)
 async def handle_photo(message: Message) -> None:
-    """Сохраняет фото в files/ и сразу передаёт агенту с описанием."""
+    """Фолбэк: если батчинг выключен или не сработал."""
     if not is_allowed(message.from_user.id):
         await message.answer("⛔ Доступ запрещён.")
         return
@@ -1694,11 +1695,10 @@ async def handle_video(message: Message) -> None:
 
 @dp.message(F.text)
 async def handle_message(message: Message) -> None:
-    """Обработка текстовых сообщений (не команд)."""
+    """Фолбэк: если батчинг выключен или не сработал."""
     if not message.text:
         return
 
-    # Пропускаем команды — их обрабатывают другие хендлеры
     if message.text.strip().startswith("/"):
         return
 
@@ -1817,6 +1817,10 @@ async def main() -> None:
             "OK" if repo_ready() else "НЕТ",
             SELF_MODIFY_AUTO_FIX,
         )
+
+    setup_message_batch(_run_agent_for_user)
+    dp.message.middleware(MessageBatchMiddleware())
+
     await _notify_after_restart(bot)
     start_scheduler(bot, _run_headless_agent, _deliver_agent_text)
     logger.info("Бот запущен")
