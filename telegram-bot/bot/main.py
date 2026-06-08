@@ -32,6 +32,14 @@ from aiogram.types import (
 )
 from dotenv import load_dotenv
 
+from .agent_sessions import (
+    SESSION_KEY_SCHEDULER,
+    clear_chat_id,
+    ensure_chat_id,
+    has_agent_session,
+    load_agent_sessions,
+    user_session_key,
+)
 from .batch_middleware import MessageBatchMiddleware, setup_message_batch
 from .scheduler import (
     SCHEDULER_ENABLED,
@@ -88,7 +96,6 @@ CURSOR_MODEL = os.getenv("CURSOR_MODEL", "auto")
 CURSOR_API_KEY = os.getenv("CURSOR_API_KEY")
 CURSOR_TIMEOUT = int(os.getenv("CURSOR_TIMEOUT_SECONDS", "300"))
 MAX_RESPONSE_LENGTH = 4000  # Лимит Telegram
-SESSIONS_FILE = Path(os.getenv("SESSIONS_FILE", "/workspace/.bot/sessions.json"))
 USER_PROMPTS_FILE = Path(os.getenv("USER_PROMPTS_FILE", "/workspace/.bot/user_prompts.json"))
 ERROR_REPORTS_DIR = Path(os.getenv("ERROR_REPORTS_DIR", "/workspace/.bot/errors"))
 DEFAULT_PROMPT_FILE = Path(__file__).resolve().parent.parent / "default_prompt.txt"
@@ -160,8 +167,6 @@ def _create_bot_session() -> AiohttpSession | None:
     return AiohttpSession(proxy=proxy)
 
 
-# Хранилище сессий: user_id -> session_active
-_user_sessions: dict[int, bool] = {}
 # Текущая директория пользователя: user_id -> Path
 _user_cwd: dict[int, Path] = {}
 # Пользовательские промпты: user_id -> str
@@ -640,29 +645,6 @@ async def _send_response(
             await asyncio.sleep(0.3)
 
 
-def _load_sessions() -> None:
-    """Загрузить сессии из файла."""
-    global _user_sessions
-    try:
-        if SESSIONS_FILE.exists():
-            data = json.loads(SESSIONS_FILE.read_text(encoding="utf-8"))
-            _user_sessions = {int(k): v for k, v in data.items()}
-    except Exception as e:
-        logger.warning("Не удалось загрузить сессии: %s", e)
-
-
-def _save_sessions() -> None:
-    """Сохранить сессии в файл."""
-    try:
-        SESSIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        SESSIONS_FILE.write_text(
-            json.dumps({str(k): v for k, v in _user_sessions.items()}, indent=2),
-            encoding="utf-8",
-        )
-    except Exception as e:
-        logger.warning("Не удалось сохранить сессии: %s", e)
-
-
 def _load_user_prompts() -> None:
     """Загрузить пользовательские промпты из файла."""
     global _user_prompts
@@ -723,17 +705,6 @@ def _set_user_prompt(user_id: int, text: str) -> None:
     _save_user_prompts()
 
 
-def _get_session_active(user_id: int) -> bool:
-    """Проверить, есть ли активная сессия у пользователя."""
-    return _user_sessions.get(user_id, False)
-
-
-def _set_session_active(user_id: int, active: bool) -> None:
-    """Установить флаг активной сессии."""
-    _user_sessions[user_id] = active
-    _save_sessions()
-
-
 def _parse_stream_status(line: str) -> str | None:
     """Извлекает короткий статус из строки stream-json для отображения в Telegram."""
     try:
@@ -770,11 +741,13 @@ def _parse_stream_status(line: str) -> str | None:
 async def run_cursor_agent_streaming(
     prompt: str,
     cwd: Path,
-    continue_session: bool,
+    *,
+    session_key: str | None = None,
     status_msg: Message | None = None,
 ) -> tuple[str, bool]:
     """
     Запускает cursor-agent со stream-json, обновляет status_msg по ходу выполнения.
+    session_key — ключ сессии (user:123, scheduler); None — разовый запуск без resume.
     Возвращает (ответ, успех).
     """
     if not CURSOR_API_KEY:
@@ -786,9 +759,13 @@ async def run_cursor_agent_streaming(
     env = os.environ.copy()
     env["CURSOR_API_KEY"] = CURSOR_API_KEY
 
+    chat_id: str | None = None
+    if session_key:
+        chat_id = await ensure_chat_id(session_key, cwd, env)
+
     cmd = [CURSOR_CLI_PATH, "--model", CURSOR_MODEL, "--force", "--output-format", "stream-json"]
-    if continue_session:
-        cmd.append("--continue")
+    if chat_id:
+        cmd.extend(["--resume", chat_id])
     cmd.extend(["--print", _sanitize_prompt_for_cli(prompt)])
 
     last_status = '<tg-emoji emoji-id="5210764626857313664">🤖</tg-emoji> Инициализация...'
@@ -958,7 +935,7 @@ async def _run_self_fix(
         response, success = await run_cursor_agent_streaming(
             prompt,
             cwd,
-            continue_session=False,
+            session_key=None,
             status_msg=status,
         )
 
@@ -1089,7 +1066,7 @@ async def cmd_new(message: Message) -> None:
         await message.answer("⛔ Доступ запрещён.")
         return
 
-    _set_session_active(message.from_user.id, False)
+    clear_chat_id(user_session_key(message.from_user.id))
     await message.answer(
         "🔄 Контекст сброшен. Следующее сообщение начнёт новый диалог.",
     )
@@ -1513,10 +1490,10 @@ async def cmd_rm(message: Message, command: CommandObject) -> None:
 
 def _build_agent_prompt(user_id: int, user_text: str, prompt_body: str) -> tuple[str, Path]:
     """Собирает полный промпт и рабочую директорию для cursor-agent."""
-    continue_session = _get_session_active(user_id)
+    session_key = user_session_key(user_id)
     parts: list[str] = []
     default_prompt = _get_default_prompt()
-    if not continue_session and default_prompt:
+    if not has_agent_session(session_key) and default_prompt:
         parts.append(default_prompt)
     user_prompt = _get_user_prompt(user_id)
     if user_prompt:
@@ -1542,7 +1519,6 @@ async def _run_agent_for_user(
 ) -> None:
     """Запускает cursor-agent и отправляет ответ пользователю."""
     user_id = message.from_user.id
-    continue_session = _get_session_active(user_id)
     prompt, agent_cwd = _build_agent_prompt(user_id, user_text, prompt_body)
 
     status_msg = await message.answer(
@@ -1552,12 +1528,9 @@ async def _run_agent_for_user(
     response, success = await run_cursor_agent_streaming(
         prompt,
         agent_cwd,
-        continue_session,
-        status_msg,
+        session_key=user_session_key(user_id),
+        status_msg=status_msg,
     )
-
-    if success:
-        _set_session_active(user_id, True)
 
     remaining_text, schedule_notes = _parse_schedule_reminders(
         response, user_id, message.chat.id
@@ -1590,7 +1563,7 @@ async def _run_headless_agent(prompt: str, user_id: int) -> tuple[str, bool]:
     """Запускает cursor-agent без Telegram-статуса (для планировщика)."""
     parts: list[str] = []
     default_prompt = _get_default_prompt()
-    if default_prompt:
+    if not has_agent_session(SESSION_KEY_SCHEDULER) and default_prompt:
         parts.append(default_prompt)
     user_prompt = _get_user_prompt(user_id)
     if user_prompt:
@@ -1600,7 +1573,7 @@ async def _run_headless_agent(prompt: str, user_id: int) -> tuple[str, bool]:
     return await run_cursor_agent_streaming(
         full_prompt,
         WORKSPACE_DIR,
-        continue_session=False,
+        session_key=SESSION_KEY_SCHEDULER,
         status_msg=None,
     )
 
@@ -1773,7 +1746,7 @@ async def main() -> None:
 
     WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
     FILES_DIR.mkdir(parents=True, exist_ok=True)
-    _load_sessions()
+    load_agent_sessions()
     _load_user_prompts()
 
     session = _create_bot_session()
