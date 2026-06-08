@@ -36,15 +36,30 @@ services:
     restart: unless-stopped
     environment:
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_PROXY=${TELEGRAM_PROXY:-}
+      - TELEGRAM_PROXY_TYPE=${TELEGRAM_PROXY_TYPE:-socks5}
       - ALLOWED_USER_IDS=${ALLOWED_USER_IDS}
       - WORKSPACE_DIR=/workspace
       - CURSOR_CLI_PATH=${CURSOR_CLI_PATH:-cursor-agent}
-      - CURSOR_MODEL=${CURSOR_MODEL:-Composer 1.5}
+      - CURSOR_MODEL=${CURSOR_MODEL:-auto}
       - CURSOR_API_KEY=${CURSOR_API_KEY}
       - CURSOR_TIMEOUT_SECONDS=${CURSOR_TIMEOUT_SECONDS:-300}
+      # Самомодификация бота
+      - SELF_MODIFY_ENABLED=${SELF_MODIFY_ENABLED:-true}
+      - SELF_MODIFY_AUTO_FIX=${SELF_MODIFY_AUTO_FIX:-true}
+      - SELF_MODIFY_CODEWORD_REQUIRED=${SELF_MODIFY_CODEWORD_REQUIRED:-true}
+      - SELF_MODIFY_CODEWORDS=${SELF_MODIFY_CODEWORDS:-бурмалда,бурмалди}
+      - BOT_REPO_DIR=/workspace/cursor_cli_agent
+      - BOT_SOURCE_DIR=/app
+      - GIT_USER_NAME=${GIT_USER_NAME:-cursor-telegram-bot}
+      - GIT_USER_EMAIL=${GIT_USER_EMAIL:-bot@cursor-cli-agent.local}
     volumes:
       # Общая рабочая директория с CloudCLI
       - cursor-workspace:/workspace
+      # Репозиторий для git-коммитов при самомодификации
+      - .:/workspace/cursor_cli_agent
+      # Live-код бота (правки применяются без пересборки образа)
+      - ./telegram-bot:/app
       # Сессии cursor-agent (контекст между сообщениями)
       - cursor-sessions:/root/.cursor
     env_file:

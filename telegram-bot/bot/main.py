@@ -14,13 +14,39 @@ import time
 import traceback
 from pathlib import Path
 
+from aiohttp import BasicAuth
 from aiogram import Bot, Dispatcher, F
-from aiogram.exceptions import TelegramBadRequest
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject, CommandStart
-from aiogram.types import BotCommand, FSInputFile, Message
+from aiogram.types import BotCommand, ErrorEvent, FSInputFile, Message
 from dotenv import load_dotenv
+
+from .self_modify import (
+    SELF_MODIFY_AUTO_FIX,
+    SELF_MODIFY_CODEWORDS,
+    build_codeword_guard_prompt,
+    build_self_fix_prompt,
+    can_auto_fix,
+    check_codeword,
+    codeword_required,
+    get_bot_code_paths,
+    has_bot_code_changes,
+    has_codeword,
+    git_commit,
+    git_discard_worktree,
+    git_log,
+    git_rollback,
+    git_status_short,
+    is_enabled as self_modify_enabled,
+    parse_commit_message,
+    record_auto_fix,
+    repo_ready,
+    schedule_restart,
+    validate_python_files,
+)
 
 load_dotenv()
 
@@ -33,11 +59,13 @@ logger = logging.getLogger(__name__)
 
 # Конфигурация
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_PROXY = os.getenv("TELEGRAM_PROXY", "").strip()
+TELEGRAM_PROXY_TYPE = os.getenv("TELEGRAM_PROXY_TYPE", "socks5").strip()
 ALLOWED_USER_IDS = [int(x.strip()) for x in os.getenv("ALLOWED_USER_IDS", "").split(",") if x.strip()]
 WORKSPACE_DIR = Path(os.getenv("WORKSPACE_DIR", "/workspace"))
 FILES_DIR = WORKSPACE_DIR / "files"
 CURSOR_CLI_PATH = os.getenv("CURSOR_CLI_PATH", "cursor-agent")
-CURSOR_MODEL = os.getenv("CURSOR_MODEL", "Composer 1.5")
+CURSOR_MODEL = os.getenv("CURSOR_MODEL", "auto")
 CURSOR_API_KEY = os.getenv("CURSOR_API_KEY")
 CURSOR_TIMEOUT = int(os.getenv("CURSOR_TIMEOUT_SECONDS", "300"))
 MAX_RESPONSE_LENGTH = 4000  # Лимит Telegram
@@ -47,6 +75,40 @@ ERROR_REPORTS_DIR = Path(os.getenv("ERROR_REPORTS_DIR", "/workspace/.bot/errors"
 DEFAULT_PROMPT_FILE = Path(__file__).resolve().parent.parent / "default_prompt.txt"
 
 dp = Dispatcher()
+
+_self_fix_lock = asyncio.Lock()
+
+
+def _parse_telegram_proxy(value: str) -> str | tuple[str, BasicAuth]:
+    """
+    Парсит TELEGRAM_PROXY:
+    - socks5://user:pass@host:port (полный URL)
+    - host:port:user:pass (короткий формат)
+    - host:port (без авторизации)
+    """
+    if "://" in value:
+        return value
+
+    parts = value.split(":")
+    if len(parts) == 4:
+        host, port, login, password = parts
+        return (f"{TELEGRAM_PROXY_TYPE}://{host}:{port}", BasicAuth(login=login, password=password))
+    if len(parts) == 2:
+        host, port = parts
+        return f"{TELEGRAM_PROXY_TYPE}://{host}:{port}"
+
+    return f"{TELEGRAM_PROXY_TYPE}://{value}"
+
+
+def _create_bot_session() -> AiohttpSession | None:
+    """Создаёт aiohttp-сессию с прокси, если задан TELEGRAM_PROXY."""
+    if not TELEGRAM_PROXY:
+        return None
+
+    proxy = _parse_telegram_proxy(TELEGRAM_PROXY)
+    logger.info("Telegram API через прокси (%s)", TELEGRAM_PROXY_TYPE)
+    return AiohttpSession(proxy=proxy)
+
 
 # Хранилище сессий: user_id -> session_active
 _user_sessions: dict[int, bool] = {}
@@ -156,7 +218,9 @@ async def _send_one_message(
         ts = time.strftime("%Y%m%d_%H%M%S")
         update_id = getattr(message, "message_id", 0)
         report_path = ERROR_REPORTS_DIR / f"error_{ts}_{update_id}.txt"
-        content = f"Ошибка: {err_name}\n{err_msg}\n\n--- Текст ---\n{text}\n\n--- Traceback ---\n{traceback.format_exc()}"
+        content = (
+            f"Ошибка: {err_name}\n{err_msg}\n\n--- Текст ---\n{text}\n\n--- Traceback ---\n{traceback.format_exc()}"
+        )
         report_path.write_text(content, encoding="utf-8")
         try:
             if edit:
@@ -432,6 +496,136 @@ async def run_cursor_agent_streaming(
         return f"❌ Ошибка: {str(e)}", False
 
 
+async def _finalize_bot_changes(
+    response: str,
+    user_text: str,
+    status_msg: Message,
+    message: Message,
+) -> bool:
+    """
+    Если агент изменил код бота — коммит и перезапуск.
+    Возвращает True, если запланирован перезапуск.
+    """
+    if not self_modify_enabled() or not repo_ready():
+        return False
+    if codeword_required() and not has_codeword(user_text):
+        return False
+    if not has_bot_code_changes():
+        return False
+
+    py_ok, py_err = validate_python_files()
+    if not py_ok:
+        git_discard_worktree()
+        await message.answer(
+            f"⛔ Синтаксическая ошибка в коде бота, изменения отменены:\n<pre>{html.escape(py_err[:2000])}</pre>"
+        )
+        return False
+
+    commit_msg = parse_commit_message(response) or (
+        f"bot: {user_text[:80].replace(chr(10), ' ')}"
+    )
+    committed, commit_result = git_commit(commit_msg, get_bot_code_paths())
+
+    note = f"📦 Коммит: <code>{html.escape(commit_msg)}</code>" if committed else html.escape(commit_result)
+    await message.answer(f"✅ <b>Код бота обновлён</b>\n{note}\n🔄 Перезапуск через 3 сек...")
+    asyncio.create_task(schedule_restart(3.0))
+    return True
+
+
+async def _run_self_fix(
+    error_text: str,
+    user_id: int,
+    bot: Bot,
+    chat_id: int,
+    user_hint: str = "",
+    auto: bool = False,
+    skip_codeword_check: bool = False,
+) -> None:
+    """Запускает cursor-agent для исправления кода бота, коммитит и перезапускается."""
+    if not self_modify_enabled():
+        await bot.send_message(chat_id, "⛔ Самомодификация отключена (SELF_MODIFY_ENABLED=false).")
+        return
+
+    if not skip_codeword_check:
+        check_text = f"{user_hint}\n{error_text}".strip()
+        ok, reason = check_codeword(check_text)
+        if not ok:
+            if auto:
+                logger.warning("Автофикс пропущен: %s", reason)
+                return
+            await bot.send_message(chat_id, f"⛔ {html.escape(reason)}")
+            return
+
+    if not repo_ready():
+        await bot.send_message(
+            chat_id,
+            "⛔ Репозиторий не смонтирован. Добавьте volume `.:/workspace/cursor_cli_agent` в docker-compose.",
+        )
+        return
+
+    if auto:
+        ok, reason = can_auto_fix()
+        if not ok:
+            logger.warning("Автофикс пропущен: %s", reason)
+            return
+
+    async with _self_fix_lock:
+        status = await bot.send_message(
+            chat_id,
+            "🔧 <b>Самоисправление</b>\nАнализирую ошибку и правлю код бота...",
+        )
+
+        prompt = build_self_fix_prompt(error_text, user_hint)
+        cwd = Path(os.getenv("BOT_REPO_DIR", "/workspace/cursor_cli_agent"))
+        if not cwd.is_dir():
+            cwd = WORKSPACE_DIR
+
+        response, success = await run_cursor_agent_streaming(
+            prompt,
+            cwd,
+            continue_session=False,
+            status_msg=status,
+        )
+
+        if not success:
+            await status.edit_text(f"⛔ Агент не смог исправить:\n<pre>{html.escape(response[:3000])}</pre>")
+            return
+
+        py_ok, py_err = validate_python_files()
+        if not py_ok:
+            git_discard_worktree()
+            await status.edit_text(
+                f"⛔ Синтаксическая ошибка после правок, изменения отменены:\n<pre>{html.escape(py_err[:2000])}</pre>"
+            )
+            return
+
+        commit_msg = parse_commit_message(response) or (
+            f"bot: auto-fix — {error_text[:80].replace(chr(10), ' ')}"
+        )
+        committed, commit_result = git_commit(commit_msg, get_bot_code_paths())
+
+        if auto:
+            record_auto_fix()
+
+        summary = response
+        for marker in ("SELF_MODIFY_COMMIT::",):
+            if marker in summary:
+                summary = summary.split(marker)[0].strip()
+
+        parts = [
+            "✅ <b>Код бота обновлён</b>",
+            f"<pre>{html.escape(summary[:2500])}</pre>",
+        ]
+        if committed:
+            parts.append(f"📦 Коммит: <code>{html.escape(commit_msg)}</code>")
+        else:
+            parts.append(f"ℹ️ {html.escape(commit_result)}")
+        parts.append("🔄 Перезапуск через 3 сек...")
+
+        await status.edit_text("\n\n".join(parts))
+        asyncio.create_task(schedule_restart(3.0))
+
+
 def is_allowed(user_id: int) -> bool:
     """Проверка доступа пользователя."""
     if not ALLOWED_USER_IDS:
@@ -476,7 +670,11 @@ async def cmd_start(message: Message) -> None:
         "/myprompt — показать свой промпт\n"
         "/clear_prompt — очистить свой промпт\n"
         "/get_global_prompt — показать глобальный промпт\n"
-        "/set_global_prompt — задать глобальный промпт",
+        "/set_global_prompt — задать глобальный промпт\n"
+        "/self_fix [описание] — попросить бота исправить свой код\n"
+        "/bot_git_status — статус git (изменения бота)\n"
+        "/bot_git_log — последние коммиты бота\n"
+        "/bot_rollback — откатить последний коммит бота",
     )
 
 
@@ -489,14 +687,20 @@ async def cmd_status(message: Message) -> None:
 
     has_key = "✅" if CURSOR_API_KEY else "❌"
     workspace_exists = "✅" if WORKSPACE_DIR.exists() else "❌"
+    self_mod = "✅" if self_modify_enabled() else "❌"
+    git_ok = "✅" if repo_ready() else "❌"
 
     await message.answer(
-        f"📊 *Статус*\n\n"
+        f"📊 <b>Статус</b>\n\n"
         f"CURSOR_API_KEY: {has_key}\n"
-        f"Рабочая директория: {workspace_exists} ({WORKSPACE_DIR})\n"
-        f"Cursor CLI: {CURSOR_CLI_PATH}\n"
-        f"Модель: {CURSOR_MODEL}",
-        parse_mode=ParseMode.MARKDOWN,
+        f"Рабочая директория: {workspace_exists} (<code>{WORKSPACE_DIR}</code>)\n"
+        f"Cursor CLI: <code>{CURSOR_CLI_PATH}</code>\n"
+        f"Модель: <code>{CURSOR_MODEL}</code>\n"
+        f"Самомодификация: {self_mod}\n"
+        f"Git-репозиторий: {git_ok}\n"
+        f"Автофикс ошибок: {'✅' if SELF_MODIFY_AUTO_FIX else '❌'}\n"
+        f"Кодовое слово: {'✅ обязательно' if codeword_required() else '❌ выкл'} "
+        f"({', '.join(SELF_MODIFY_CODEWORDS)})",
     )
 
 
@@ -526,9 +730,77 @@ async def cmd_help(message: Message) -> None:
         '• "Найди баги в main.py"\n'
         '• "Добавь обработку ошибок в api"\n'
         '• "Объясни что делает функция parse"\n\n'
-        "Системные команды: /cd, /pwd, /ls, /mkdir, /cat, /rm",
+        "Системные команды: /cd, /pwd, /ls, /mkdir, /cat, /rm\n\n"
+        "Обновление бота — напиши «бурмалда» в сообщении, бот сам поймёт нужна ли правка кода.\n"
+        "/self_fix [описание] — принудительное самоисправление (без кодового слова)\n"
+        "/bot_git_status — изменения в git\n"
+        "/bot_git_log — история коммитов\n"
+        "/bot_rollback [N] — откат N коммитов",
         parse_mode=ParseMode.MARKDOWN,
     )
+
+
+@dp.message(Command("self_fix"))
+async def cmd_self_fix(message: Message, command: CommandObject) -> None:
+    """Команда /self_fix — ручной запуск самоисправления."""
+    if not is_allowed(message.from_user.id):
+        await message.answer("⛔ Доступ запрещён.")
+        return
+
+    hint = (command.args or "").strip()
+    error_text = hint or "Пользователь запросил улучшение/исправление кода бота."
+    asyncio.create_task(
+        _run_self_fix(
+            error_text,
+            message.from_user.id,
+            message.bot,
+            message.chat.id,
+            user_hint=hint,
+            auto=False,
+            skip_codeword_check=True,
+        )
+    )
+
+
+@dp.message(Command("bot_git_status"))
+async def cmd_bot_git_status(message: Message) -> None:
+    if not is_allowed(message.from_user.id):
+        await message.answer("⛔ Доступ запрещён.")
+        return
+    await message.answer(f"<pre>{html.escape(git_status_short())}</pre>")
+
+
+@dp.message(Command("bot_git_log"))
+async def cmd_bot_git_log(message: Message, command: CommandObject) -> None:
+    if not is_allowed(message.from_user.id):
+        await message.answer("⛔ Доступ запрещён.")
+        return
+    limit = 10
+    if command.args and command.args.strip().isdigit():
+        limit = min(int(command.args.strip()), 30)
+    await message.answer(f"<pre>{html.escape(git_log(limit))}</pre>")
+
+
+@dp.message(Command("bot_rollback"))
+async def cmd_bot_rollback(message: Message, command: CommandObject) -> None:
+    if not is_allowed(message.from_user.id):
+        await message.answer("⛔ Доступ запрещён.")
+        return
+
+    args = (command.args or "").strip()
+    steps = 1
+    tokens = args.split()
+    for token in tokens:
+        if token.isdigit():
+            steps = min(int(token), 5)
+            break
+
+    ok, result = git_rollback(steps)
+    if ok:
+        await message.answer(f"✅ {html.escape(result)}\n🔄 Перезапуск через 3 сек...")
+        asyncio.create_task(schedule_restart(3.0))
+    else:
+        await message.answer(f"⛔ {html.escape(result)}")
 
 
 @dp.message(Command("set_prompt"))
@@ -849,6 +1121,7 @@ async def handle_message(message: Message) -> None:
 
     user_id = message.from_user.id
     continue_session = _get_session_active(user_id)
+    user_text = message.text.strip()
 
     # При новом чате — единоразово добавляем глобальный промпт
     parts: list[str] = []
@@ -859,14 +1132,24 @@ async def handle_message(message: Message) -> None:
     user_prompt = _get_user_prompt(user_id)
     if user_prompt:
         parts.append(f"--- Информация от пользователя ---\n{user_prompt}\n---")
+    codeword_guard = build_codeword_guard_prompt(user_text)
+    if codeword_guard:
+        parts.append(codeword_guard)
     parts.append(prompt)
     prompt = "\n\n".join(parts)
+
+    # Для самомодификации агенту удобнее корень репозитория
+    agent_cwd = _get_user_cwd(user_id)
+    if self_modify_enabled() and codeword_required() and has_codeword(user_text):
+        repo = Path(os.getenv("BOT_REPO_DIR", "/workspace/cursor_cli_agent"))
+        if repo.is_dir():
+            agent_cwd = repo
 
     status_msg = await message.answer('<tg-emoji emoji-id="5210764626857313664">🤖</tg-emoji> Инициализация...')
 
     response, success = await run_cursor_agent_streaming(
         prompt,
-        _get_user_cwd(user_id),
+        agent_cwd,
         continue_session,
         status_msg,
     )
@@ -890,6 +1173,58 @@ async def handle_message(message: Message) -> None:
 
     await _send_response(status_msg, remaining_text or "(пустой ответ)", message, bot)
 
+    if success:
+        await _finalize_bot_changes(response, user_text, status_msg, message)
+
+
+@dp.errors()
+async def global_error_handler(event: ErrorEvent) -> None:
+    """Ловит необработанные ошибки и при необходимости запускает автофикс."""
+    logger.exception("Необработанная ошибка: %s", event.exception)
+
+    update = event.update
+    if not update or not update.message:
+        return
+
+    msg = update.message
+    if not is_allowed(msg.from_user.id):
+        return
+
+    err_text = "".join(traceback.format_exception(type(event.exception), event.exception, event.exception.__traceback__))
+    ERROR_REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    report_path = ERROR_REPORTS_DIR / f"crash_{ts}.txt"
+    report_path.write_text(err_text, encoding="utf-8")
+
+    auto_fix_will_run = (
+        self_modify_enabled()
+        and SELF_MODIFY_AUTO_FIX
+        and check_codeword(err_text)[0]
+    )
+    try:
+        crash_msg = (
+            f"💥 <b>Критическая ошибка</b>\n<code>{html.escape(type(event.exception).__name__)}</code>"
+        )
+        if auto_fix_will_run:
+            crash_msg += "\nЗапускаю самоисправление..."
+        elif self_modify_enabled() and SELF_MODIFY_AUTO_FIX and codeword_required():
+            words = ", ".join(f"«{w}»" for w in SELF_MODIFY_CODEWORDS)
+            crash_msg += f"\nАвтофикс пропущен. Используй /self_fix или сообщение с кодовым словом ({words})."
+        await msg.answer(crash_msg)
+    except Exception:
+        pass
+
+    if auto_fix_will_run:
+        asyncio.create_task(
+            _run_self_fix(
+                err_text[-4000:],
+                msg.from_user.id,
+                event.bot,
+                msg.chat.id,
+                auto=True,
+            )
+        )
+
 
 async def main() -> None:
     """Запуск бота."""
@@ -904,8 +1239,10 @@ async def main() -> None:
     _load_sessions()
     _load_user_prompts()
 
+    session = _create_bot_session()
     bot = Bot(
         token=TELEGRAM_BOT_TOKEN,
+        session=session,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML, link_preview_is_disabled=True),
     )
 
@@ -927,11 +1264,25 @@ async def main() -> None:
             BotCommand(command="mkdir", description="Создать директорию"),
             BotCommand(command="cat", description="Показать файл"),
             BotCommand(command="rm", description="Удалить файл/папку"),
+            BotCommand(command="self_fix", description="Исправить код бота"),
+            BotCommand(command="bot_git_status", description="Git-статус бота"),
+            BotCommand(command="bot_git_log", description="Коммиты бота"),
+            BotCommand(command="bot_rollback", description="Откат коммита бота"),
         ]
     )
 
+    if self_modify_enabled():
+        logger.info(
+            "Самомодификация: вкл, repo=%s, auto_fix=%s",
+            "OK" if repo_ready() else "НЕТ",
+            SELF_MODIFY_AUTO_FIX,
+        )
     logger.info("Бот запущен")
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        if session is not None:
+            await session.close()
 
 
 if __name__ == "__main__":
