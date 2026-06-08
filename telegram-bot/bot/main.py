@@ -21,7 +21,14 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject, CommandStart
-from aiogram.types import BotCommand, ErrorEvent, FSInputFile, Message
+from aiogram.types import (
+    BotCommand,
+    ErrorEvent,
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 from dotenv import load_dotenv
 
 from .self_modify import (
@@ -182,6 +189,63 @@ def _parse_send_document(text: str) -> tuple[str, list[tuple[Path, str, str]]]:
     return remaining, docs
 
 
+_INLINE_URL_PREFIXES = ("http://", "https://", "tg://")
+
+
+def _parse_button_pair(raw: str) -> tuple[str, str] | None:
+    """Парсит пару url::текст для inline-кнопки."""
+    parts = raw.split("::", 1)
+    if len(parts) != 2:
+        return None
+    url, label = parts[0].strip(), parts[1].strip()
+    if not url or not label:
+        return None
+    if not url.startswith(_INLINE_URL_PREFIXES):
+        return None
+    return url, label
+
+
+def _parse_inline_buttons(text: str) -> tuple[str, list[list[tuple[str, str]]]]:
+    """
+    Извлекает директивы inline-кнопок из текста.
+    inline_button::url::текст — одна кнопка в отдельном ряду
+    inline_button_row::url::текст;;url::текст — несколько кнопок в одном ряду
+    Возвращает (текст без директив, список рядов кнопок).
+    """
+    rows: list[list[tuple[str, str]]] = []
+    remaining = text
+
+    for m in re.finditer(r"inline_button_row::([^\n]+)", text):
+        row: list[tuple[str, str]] = []
+        for part in m.group(1).split(";;"):
+            pair = _parse_button_pair(part.strip())
+            if pair:
+                row.append(pair)
+        if row:
+            rows.append(row)
+        remaining = remaining.replace(m.group(0), "")
+
+    for m in re.finditer(r"inline_button::([^\n]+)", remaining):
+        pair = _parse_button_pair(m.group(1))
+        if pair:
+            rows.append([pair])
+        remaining = remaining.replace(m.group(0), "")
+
+    remaining = re.sub(r"\n{3,}", "\n\n", remaining.strip())
+    return remaining, rows
+
+
+def _build_inline_markup(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup | None:
+    """Собирает InlineKeyboardMarkup из рядов (url, текст)."""
+    if not rows:
+        return None
+    keyboard = [
+        [InlineKeyboardButton(text=label, url=url) for url, label in row]
+        for row in rows
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
 MSG_SPLIT_SEP = ";;;"
 
 
@@ -211,6 +275,7 @@ async def _send_one_message(
     message: Message,
     bot: Bot,
     edit: bool = False,
+    reply_markup: InlineKeyboardMarkup | None = None,
 ) -> bool:
     """
     Отправляет одно сообщение (edit или answer). При ошибке — логирует и отправляет отчёт.
@@ -220,9 +285,15 @@ async def _send_one_message(
         text = text[:MAX_RESPONSE_LENGTH] + "\n\n... (обрезано)"
     try:
         if edit:
-            await target.edit_text(text or "(пустой ответ)")
+            await target.edit_text(
+                text or "(пустой ответ)",
+                reply_markup=reply_markup,
+            )
         else:
-            await message.answer(text or "(пустой ответ)")
+            await message.answer(
+                text or "(пустой ответ)",
+                reply_markup=reply_markup,
+            )
         return True
     except TelegramBadRequest as e:
         err_name = type(e).__name__
@@ -270,12 +341,15 @@ async def _send_response(
     parts = _split_response_messages(response)
     for i, part in enumerate(parts):
         is_first = i == 0
+        clean_part, button_rows = _parse_inline_buttons(part)
+        reply_markup = _build_inline_markup(button_rows)
         await _send_one_message(
             status_msg,
-            part,
+            clean_part,
             message,
             bot,
             edit=is_first,
+            reply_markup=reply_markup,
         )
         if not is_first:
             # Небольшая задержка между сообщениями (антифлуд)
