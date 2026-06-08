@@ -45,8 +45,10 @@ from .self_modify import (
     git_commit,
     git_discard_worktree,
     git_log,
+    git_push,
     git_rollback,
     git_status_short,
+    pop_restart_notification,
     is_enabled as self_modify_enabled,
     parse_commit_message,
     record_auto_fix,
@@ -84,6 +86,37 @@ DEFAULT_PROMPT_FILE = Path(__file__).resolve().parent.parent / "default_prompt.t
 dp = Dispatcher()
 
 _self_fix_lock = asyncio.Lock()
+_RESTART_NOTIFY_TEXT = (
+    '✅ <b>Бот перезапущен</b> и снова на связи! '
+    '<tg-emoji emoji-id="5377809374016192785">🐱</tg-emoji>'
+)
+
+
+def _format_commit_push_notes(committed: bool, commit_msg: str, commit_result: str) -> str:
+    """Форматирует строки о коммите и push для Telegram."""
+    if not committed:
+        return html.escape(commit_result)
+    lines = [f"📦 Коммит: <code>{html.escape(commit_msg)}</code>"]
+    pushed, push_result = git_push()
+    icon = "📤" if pushed else "⚠️"
+    lines.append(f"{icon} Push: {html.escape(push_result)}")
+    return "\n".join(lines)
+
+
+async def _notify_after_restart(bot: Bot) -> None:
+    """Отправляет уведомление пользователю после перезапуска бота."""
+    pending = pop_restart_notification()
+    if not pending:
+        return
+    chat_id = pending.get("chat_id")
+    text = pending.get("text")
+    if not chat_id or not text:
+        return
+    try:
+        await bot.send_message(int(chat_id), str(text))
+        logger.info("Отправлено уведомление после перезапуска в chat_id=%s", chat_id)
+    except Exception as e:
+        logger.warning("Не удалось отправить уведомление после перезапуска: %s", e)
 
 
 def _parse_telegram_proxy(value: str) -> str | tuple[str, BasicAuth]:
@@ -733,9 +766,11 @@ async def _finalize_bot_changes(
     )
     committed, commit_result = git_commit(commit_msg, get_bot_code_paths())
 
-    note = f"📦 Коммит: <code>{html.escape(commit_msg)}</code>" if committed else html.escape(commit_result)
+    note = _format_commit_push_notes(committed, commit_msg, commit_result)
     await message.answer(f"✅ <b>Код бота обновлён</b>\n{note}\n🔄 Перезапуск через 3 сек...")
-    asyncio.create_task(schedule_restart(3.0))
+    asyncio.create_task(
+        schedule_restart(3.0, chat_id=message.chat.id, notify_text=_RESTART_NOTIFY_TEXT)
+    )
     return True
 
 
@@ -823,14 +858,13 @@ async def _run_self_fix(
             "✅ <b>Код бота обновлён</b>",
             f"<pre>{html.escape(summary[:2500])}</pre>",
         ]
-        if committed:
-            parts.append(f"📦 Коммит: <code>{html.escape(commit_msg)}</code>")
-        else:
-            parts.append(f"ℹ️ {html.escape(commit_result)}")
+        parts.append(_format_commit_push_notes(committed, commit_msg, commit_result))
         parts.append("🔄 Перезапуск через 3 сек...")
 
         await status.edit_text("\n\n".join(parts))
-        asyncio.create_task(schedule_restart(3.0))
+        asyncio.create_task(
+            schedule_restart(3.0, chat_id=chat_id, notify_text=_RESTART_NOTIFY_TEXT)
+        )
 
 
 def is_allowed(user_id: int) -> bool:
@@ -1004,8 +1038,16 @@ async def cmd_bot_rollback(message: Message, command: CommandObject) -> None:
 
     ok, result = git_rollback(steps)
     if ok:
-        await message.answer(f"✅ {html.escape(result)}\n🔄 Перезапуск через 3 сек...")
-        asyncio.create_task(schedule_restart(3.0))
+        push_note = ""
+        pushed, push_result = git_push()
+        icon = "📤" if pushed else "⚠️"
+        push_note = f"\n{icon} Push: {html.escape(push_result)}"
+        await message.answer(
+            f"✅ {html.escape(result)}{push_note}\n🔄 Перезапуск через 3 сек..."
+        )
+        asyncio.create_task(
+            schedule_restart(3.0, chat_id=message.chat.id, notify_text=_RESTART_NOTIFY_TEXT)
+        )
     else:
         await message.answer(f"⛔ {html.escape(result)}")
 
@@ -1484,6 +1526,7 @@ async def main() -> None:
             "OK" if repo_ready() else "НЕТ",
             SELF_MODIFY_AUTO_FIX,
         )
+    await _notify_after_restart(bot)
     logger.info("Бот запущен")
     try:
         await dp.start_polling(bot)

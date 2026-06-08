@@ -38,6 +38,8 @@ SELF_MODIFY_STATE_FILE = Path(
 
 GIT_USER_NAME = os.getenv("GIT_USER_NAME", "cursor-telegram-bot")
 GIT_USER_EMAIL = os.getenv("GIT_USER_EMAIL", "bot@cursor-cli-agent.local")
+SELF_MODIFY_GIT_PUSH = os.getenv("SELF_MODIFY_GIT_PUSH", "true").lower() in ("1", "true", "yes")
+GIT_PUSH_TIMEOUT = int(os.getenv("GIT_PUSH_TIMEOUT_SECONDS", "120"))
 
 # Файлы бота, которые разрешено менять при самоисправлении
 BOT_CODE_GLOBS = ("bot/**/*.py", "default_prompt.txt", "requirements.txt")
@@ -112,7 +114,12 @@ def get_bot_code_paths() -> list[Path]:
     return sorted(p for p in paths if p.is_file())
 
 
-def _run_git(args: list[str], cwd: Path | None = None) -> tuple[int, str, str]:
+def _run_git(
+    args: list[str],
+    cwd: Path | None = None,
+    *,
+    timeout: int = 60,
+) -> tuple[int, str, str]:
     repo = cwd or BOT_REPO_DIR
     env = os.environ.copy()
     env.setdefault("GIT_AUTHOR_NAME", GIT_USER_NAME)
@@ -127,7 +134,7 @@ def _run_git(args: list[str], cwd: Path | None = None) -> tuple[int, str, str]:
             env=env,
             capture_output=True,
             text=True,
-            timeout=60,
+            timeout=timeout,
             check=False,
         )
         return result.returncode, result.stdout.strip(), result.stderr.strip()
@@ -195,6 +202,28 @@ def git_commit(message: str, paths: list[Path] | None = None) -> tuple[bool, str
 
     _save_state_after_commit(message)
     return True, out or "Коммит создан"
+
+
+def git_push() -> tuple[bool, str]:
+    """Пушит текущую ветку в origin. Возвращает (успех, сообщение)."""
+    if not SELF_MODIFY_GIT_PUSH:
+        return False, "Push отключён (SELF_MODIFY_GIT_PUSH=false)"
+    if not repo_ready():
+        return False, f"Git-репозиторий не найден: {BOT_REPO_DIR}"
+
+    code, branch, err = _run_git(["rev-parse", "--abbrev-ref", "HEAD"])
+    if code != 0 or not branch:
+        return False, err or "Не удалось определить ветку"
+
+    code, out, err = _run_git(["push", "origin", branch], timeout=GIT_PUSH_TIMEOUT)
+    if code != 0:
+        code, out2, err2 = _run_git(["push"], timeout=GIT_PUSH_TIMEOUT)
+        if code != 0:
+            detail = err2 or out2 or err or out or "git push failed"
+            return False, detail
+        out = out2 or out
+
+    return True, out or f"Отправлено в origin/{branch}"
 
 
 def git_discard_worktree() -> tuple[bool, str]:
@@ -356,8 +385,39 @@ def parse_commit_message(agent_response: str) -> str | None:
     return None
 
 
-async def schedule_restart(delay_seconds: float = 2.0) -> None:
+def save_restart_notification(chat_id: int, text: str) -> None:
+    """Сохраняет уведомление для отправки после перезапуска процесса."""
+    state = _load_state()
+    state["pending_restart_notify"] = {
+        "chat_id": chat_id,
+        "text": text,
+        "ts": time.time(),
+    }
+    _save_state(state)
+
+
+def pop_restart_notification(max_age_seconds: float = 120.0) -> dict | None:
+    """Забирает отложенное уведомление после перезапуска (если не устарело)."""
+    state = _load_state()
+    notify = state.pop("pending_restart_notify", None)
+    _save_state(state)
+    if not notify:
+        return None
+    if time.time() - float(notify.get("ts", 0)) > max_age_seconds:
+        logger.info("Уведомление после перезапуска устарело, пропуск")
+        return None
+    return notify
+
+
+async def schedule_restart(
+    delay_seconds: float = 2.0,
+    *,
+    chat_id: int | None = None,
+    notify_text: str | None = None,
+) -> None:
     """Перезапускает процесс бота (Docker restart: unless-stopped подхватит)."""
+    if chat_id is not None and notify_text:
+        save_restart_notification(chat_id, notify_text)
     await asyncio.sleep(delay_seconds)
     logger.info("Перезапуск бота после самомодификации...")
     os.execv(sys.executable, [sys.executable, "-m", "bot"])
