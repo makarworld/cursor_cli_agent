@@ -185,6 +185,20 @@ def _parse_send_document(text: str) -> tuple[str, list[tuple[Path, str, str]]]:
 MSG_SPLIT_SEP = ";;;"
 
 
+def _sanitize_prompt_for_cli(text: str) -> str:
+    """
+    cursor-agent ошибочно парсит строки с '---' как CLI-флаги.
+    Убираем опасные префиксы перед передачей в --print.
+    """
+    lines: list[str] = []
+    for line in text.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith("---"):
+            line = line.replace("---", "###", 1)
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def _split_response_messages(text: str) -> list[str]:
     """Разбивает текст по ;;; на отдельные сообщения."""
     parts = [p.strip() for p in text.split(MSG_SPLIT_SEP) if p.strip()]
@@ -417,7 +431,7 @@ async def run_cursor_agent_streaming(
     cmd = [CURSOR_CLI_PATH, "--model", CURSOR_MODEL, "--force", "--output-format", "stream-json"]
     if continue_session:
         cmd.append("--continue")
-    cmd.extend(["--print", prompt])
+    cmd.extend(["--print", _sanitize_prompt_for_cli(prompt)])
 
     last_status = '<tg-emoji emoji-id="5210764626857313664">🤖</tg-emoji> Инициализация...'
     last_edit_time = [0.0]  # mutable для доступа из вложенной функции
@@ -1131,7 +1145,7 @@ async def handle_message(message: Message) -> None:
     # Пользовательский промпт добавляется всегда, если задан
     user_prompt = _get_user_prompt(user_id)
     if user_prompt:
-        parts.append(f"--- Информация от пользователя ---\n{user_prompt}\n---")
+        parts.append(f"[Информация от пользователя]\n{user_prompt}\n[/Информация от пользователя]")
     codeword_guard = build_codeword_guard_prompt(user_text)
     if codeword_guard:
         parts.append(codeword_guard)
