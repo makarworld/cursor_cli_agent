@@ -203,7 +203,7 @@ async def _process_one_event(
     bot: Bot,
     event: ScheduledEvent,
     run_agent: Callable[[str, int], Awaitable[tuple[str, bool]]],
-    deliver: Callable[[int, str], Awaitable[None]],
+    deliver: Callable[[Bot, int, str], Awaitable[None]],
 ) -> None:
     """Обрабатывает одно сработавшее напоминание."""
     prompt = build_reminder_prompt(event)
@@ -213,7 +213,7 @@ async def _process_one_event(
         return
 
     try:
-        await deliver(event.chat_id, response)
+        await deliver(bot, event.chat_id, response)
         mark_reminded(event.id)
         logger.info("Напоминание id=%s отправлено в chat_id=%s", event.id, event.chat_id)
     except Exception as e:
@@ -223,7 +223,7 @@ async def _process_one_event(
 async def _scheduler_tick(
     bot: Bot,
     run_agent: Callable[[str, int], Awaitable[tuple[str, bool]]],
-    deliver: Callable[[int, str], Awaitable[None]],
+    deliver: Callable[[Bot, int, str], Awaitable[None]],
 ) -> None:
     """Одна итерация проверки БД."""
     async with _scheduler_lock:
@@ -238,7 +238,7 @@ async def _scheduler_tick(
 async def scheduler_loop(
     bot: Bot,
     run_agent: Callable[[str, int], Awaitable[tuple[str, bool]]],
-    deliver: Callable[[int, str], Awaitable[None]],
+    deliver: Callable[[Bot, int, str], Awaitable[None]],
 ) -> None:
     """Фоновый цикл проверки напоминаний."""
     logger.info(
@@ -257,7 +257,7 @@ async def scheduler_loop(
 def start_scheduler(
     bot: Bot,
     run_agent: Callable[[str, int], Awaitable[tuple[str, bool]]],
-    deliver: Callable[[int, str], Awaitable[None]],
+    deliver: Callable[[Bot, int, str], Awaitable[None]],
 ) -> asyncio.Task | None:
     """Запускает фоновую задачу планировщика."""
     global _loop_task
