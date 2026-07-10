@@ -438,6 +438,91 @@ def _strip_html_tags(text: str) -> str:
     return re.sub(r"<[^>]*>", "", text)
 
 
+def _get_open_html_tags(text: str) -> list[str]:
+    """Возвращает стек незакрытых HTML-тегов в фрагменте."""
+    open_stack: list[str] = []
+    i = 0
+    while i < len(text):
+        if text[i] != "<":
+            i += 1
+            continue
+        end = text.find(">", i)
+        if end == -1:
+            break
+        inner = text[i + 1 : end]
+        if inner.startswith("/"):
+            name = _html_tag_name(inner)
+            if name and open_stack and open_stack[-1] == name:
+                open_stack.pop()
+        else:
+            name = _html_tag_name(inner)
+            if name and (name in _TELEGRAM_HTML_TAGS or name.startswith("tg-")):
+                open_stack.append(name)
+        i = end + 1
+    return open_stack
+
+
+def _prepend_open_tags(text: str, tags: list[str]) -> str:
+    if not tags:
+        return text
+    return "".join(f"<{t}>" for t in tags) + text
+
+
+def _split_long_text(text: str, max_len: int = MAX_RESPONSE_LENGTH) -> list[str]:
+    """
+    Разбивает длинный текст на части ≤ max_len.
+    Не режет внутри HTML-тегов; переносит открытые теги в следующую часть.
+    """
+    text = text.strip()
+    if not text:
+        return ["(пустой ответ)"]
+    if len(text) <= max_len:
+        return [text]
+
+    chunks: list[str] = []
+    remaining = text
+    carry_tags: list[str] = []
+
+    while remaining:
+        prefix = _prepend_open_tags("", carry_tags)
+        effective_max = max_len - len(prefix)
+
+        if len(remaining) <= effective_max:
+            chunks.append(_balance_html_tags((prefix + remaining).strip()))
+            break
+
+        cut = effective_max
+        nl = remaining.rfind("\n", 0, cut)
+        if nl > cut // 2:
+            cut = nl + 1
+
+        lt = remaining.rfind("<", 0, cut)
+        gt = remaining.rfind(">", 0, cut)
+        if lt > gt:
+            cut = lt
+
+        # Учитываем закрывающие теги, которые добавит _balance_html_tags
+        while cut > 0:
+            piece = remaining[:cut]
+            full_chunk = prefix + piece
+            balanced = _balance_html_tags(full_chunk.strip())
+            if len(balanced) <= max_len:
+                carry_tags = _get_open_html_tags(balanced)
+                chunks.append(balanced)
+                remaining = remaining[cut:].lstrip("\n")
+                break
+            cut -= max(1, len(balanced) - max_len)
+        else:
+            # Крайний случай: один символ
+            piece = remaining[:1]
+            balanced = _balance_html_tags((prefix + piece).strip())
+            carry_tags = _get_open_html_tags(balanced)
+            chunks.append(balanced)
+            remaining = remaining[1:].lstrip("\n")
+
+    return chunks or ["(пустой ответ)"]
+
+
 def _split_response_messages(text: str) -> list[str]:
     """
     Разбивает текст по ;;; на отдельные сообщения.
@@ -516,10 +601,8 @@ async def _send_one_message(
 ) -> bool:
     """
     Отправляет одно сообщение (edit или answer). При ошибке — логирует и отправляет отчёт.
-    Возвращает True при успехе.
+    Возвращает True при успехе. Длинный текст должен быть разбит вызывающим кодом.
     """
-    if len(text) > MAX_RESPONSE_LENGTH:
-        text = text[:MAX_RESPONSE_LENGTH] + "\n\n... (обрезано)"
     text = _balance_html_tags(text or "(пустой ответ)")
 
     async def _do_send(body: str, *, use_html: bool = True) -> None:
@@ -598,22 +681,24 @@ async def _deliver_agent_text(bot: Bot, chat_id: int, response: str) -> None:
             logger.warning("Не удалось отправить файл %s: %s", path, e)
 
     parts = _split_response_messages(remaining_text)
-    for i, part in enumerate(parts):
+    send_count = 0
+    for part in parts:
         clean_part, button_rows = _parse_inline_buttons(part)
         reply_markup = _build_inline_markup(button_rows)
-        text = clean_part
-        if len(text) > MAX_RESPONSE_LENGTH:
-            text = text[:MAX_RESPONSE_LENGTH] + "\n\n... (обрезано)"
-        text = _balance_html_tags(text or "(пустой ответ)")
-        try:
-            await bot.send_message(chat_id, text, reply_markup=reply_markup)
-        except TelegramBadRequest:
+        chunks = _split_long_text(clean_part)
+        for j, chunk in enumerate(chunks):
+            markup = reply_markup if j == 0 else None
+            text = _balance_html_tags(chunk or "(пустой ответ)")
             try:
-                await bot.send_message(chat_id, _strip_html_tags(text), parse_mode=None)
-            except Exception as e:
-                logger.error("Не удалось отправить проактивное сообщение: %s", e)
-        if i < len(parts) - 1:
-            await asyncio.sleep(0.3)
+                await bot.send_message(chat_id, text, reply_markup=markup)
+            except TelegramBadRequest:
+                try:
+                    await bot.send_message(chat_id, _strip_html_tags(text), parse_mode=None)
+                except Exception as e:
+                    logger.error("Не удалось отправить проактивное сообщение: %s", e)
+            send_count += 1
+            if send_count > 1:
+                await asyncio.sleep(0.3)
 
 
 async def _send_response(
@@ -628,21 +713,24 @@ async def _send_response(
     логирует, пишет в файл, отправляет файл пользователю и короткое сообщение.
     """
     parts = _split_response_messages(response)
-    for i, part in enumerate(parts):
-        is_first = i == 0
+    is_first_send = True
+    for part in parts:
         clean_part, button_rows = _parse_inline_buttons(part)
         reply_markup = _build_inline_markup(button_rows)
-        await _send_one_message(
-            status_msg,
-            clean_part,
-            message,
-            bot,
-            edit=is_first,
-            reply_markup=reply_markup,
-        )
-        if not is_first:
-            # Небольшая задержка между сообщениями (антифлуд)
-            await asyncio.sleep(0.3)
+        chunks = _split_long_text(clean_part)
+        for j, chunk in enumerate(chunks):
+            markup = reply_markup if j == 0 else None
+            await _send_one_message(
+                status_msg,
+                chunk,
+                message,
+                bot,
+                edit=is_first_send,
+                reply_markup=markup,
+            )
+            if not is_first_send:
+                await asyncio.sleep(0.3)
+            is_first_send = False
 
 
 def _load_user_prompts() -> None:
@@ -828,8 +916,6 @@ async def run_cursor_agent_streaming(
             return f"❌ Ошибка Cursor CLI:\n```\n{err}\n```", False
 
         output = "".join(assistant_parts).strip() or "(пустой ответ)"
-        if len(output) > MAX_RESPONSE_LENGTH:
-            output = output[:MAX_RESPONSE_LENGTH] + "\n\n... (обрезано)"
         return output, True
 
     try:
@@ -1445,10 +1531,13 @@ async def cmd_cat(message: Message, command: CommandObject) -> None:
 
     try:
         content = path.read_text(encoding="utf-8", errors="replace")
-        if len(content) > 3500:
-            content = content[:3500] + "\n\n... (обрезано)"
-        content = html.escape(content)
-        await message.answer(f"<pre>{content}</pre>")
+        escaped = html.escape(content)
+        pre_max = MAX_RESPONSE_LENGTH - len("<pre></pre>")
+        chunks = _split_long_text(escaped, max_len=pre_max)
+        for i, chunk in enumerate(chunks):
+            await message.answer(f"<pre>{chunk}</pre>")
+            if i < len(chunks) - 1:
+                await asyncio.sleep(0.3)
     except OSError as e:
         await message.answer(f"⛔ Ошибка: {e}")
 
