@@ -1100,7 +1100,7 @@ def _guest_session_key(user_id: int) -> str:
     return f"guest:{user_id}"
 
 
-_GUEST_RESET_RE = re.compile(r"(?:^|\s)/?(?:new|reset|сброс)(?:\s|$)", re.I)
+_GUEST_RESET_RE = re.compile(r"^/?(?:new|reset|сброс)\s*$", re.I)
 
 
 def _display_name(entity) -> str:
@@ -1148,16 +1148,8 @@ def _format_guest_chat_context(message: Message) -> str:
 
 
 def _is_guest_reset_query(text: str) -> bool:
-    """Сброс guest-контекста: бурмалда, /new бурмалда или reset/сброс с кодовым словом."""
-    if not has_codeword(text):
-        return False
-    if _GUEST_RESET_RE.search(text):
-        return True
-    remainder = text.lower().strip()
-    for word in SELF_MODIFY_CODEWORDS:
-        remainder = remainder.replace(word, "")
-    remainder = re.sub(r"[\s/.,!?]+", "", remainder)
-    return remainder == ""
+    """Сброс guest-контекста: только /new (или reset/сброс), без кодового слова."""
+    return bool(_GUEST_RESET_RE.match(text.strip()))
 
 
 def _strip_bot_mention(text: str) -> str:
@@ -1278,7 +1270,7 @@ async def cmd_start(message: Message) -> None:
         "<b>В любом чате (в т.ч. с друзьями):</b>\n"
         "• Упомяни @бота в сообщении (Guest Mode)\n"
         "• Или набери @бота в поле ввода и выбери результат (Inline Mode)\n"
-        "• @бот бурмалда — сброс контекста Guest Mode (или /new бурмалда)\n\n"
+        "• @бот /new — сброс контекста Guest Mode в переписке\n\n"
         "<b>Команды:</b>\n"
         "/start — это сообщение\n"
         "/new — сбросить контекст, начать новый диалог\n"
@@ -1356,7 +1348,7 @@ async def cmd_help(message: Message) -> None:
         '• "Объясни что делает функция parse"\n\n'
         "<b>В переписке с кем угодно:</b>\n"
         "• @бот что такое дуги на брекитах — Guest Mode (ответ прямо в чат)\n"
-        "• @бот бурмалда — сброс контекста Guest Mode (или /new бурмалда)\n"
+        "• @бот /new — сброс контекста Guest Mode в переписке\n"
         "• @бот в поле ввода → выбрать результат — Inline Mode\n"
         "Нужно включить Guest Mode и Inline Mode в @BotFather.\n\n"
         "Системные команды: /cd, /pwd, /ls, /mkdir, /cat, /rm\n\n"
