@@ -12,6 +12,7 @@ import os
 import re
 import time
 import traceback
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -24,10 +25,14 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import (
     BotCommand,
+    ChosenInlineResult,
     ErrorEvent,
     FSInputFile,
+    InlineQuery,
+    InlineQueryResultArticle,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputTextMessageContent,
     Message,
 )
 from dotenv import load_dotenv
@@ -76,6 +81,10 @@ from .self_modify import (
 )
 
 load_dotenv()
+load_dotenv(
+    Path(os.getenv("WORKSPACE_DIR", "/workspace")) / "cursor_cli_agent" / ".env",
+    override=True,
+)
 
 # Настройка логирования
 logging.basicConfig(
@@ -102,6 +111,8 @@ DEFAULT_PROMPT_FILE = Path(__file__).resolve().parent.parent / "default_prompt.t
 
 dp = Dispatcher()
 
+_bot_username: str | None = None
+_pending_inline: dict[str, tuple[str, int]] = {}
 _self_fix_lock = asyncio.Lock()
 _RESTART_NOTIFY_TEXT = (
     '✅ <b>Бот перезапущен</b> и снова на связи! '
@@ -1070,6 +1081,80 @@ def is_allowed(user_id: int) -> bool:
     return user_id in ALLOWED_USER_IDS
 
 
+def _guest_session_key(user_id: int) -> str:
+    return f"guest:{user_id}"
+
+
+def _strip_bot_mention(text: str) -> str:
+    """Убирает @username бота из текста."""
+    if not text:
+        return ""
+    if _bot_username:
+        text = re.sub(rf"@{re.escape(_bot_username)}\b", "", text, flags=re.I)
+    return re.sub(r"@\w+\s*", "", text, count=1).strip()
+
+
+def _clean_external_response(text: str) -> str:
+    """Убирает служебные директивы из ответа для guest/inline."""
+    cleaned = text
+    for marker in ("SELF_MODIFY_COMMIT::", "schedule_reminder::"):
+        if marker in cleaned:
+            cleaned = cleaned.split(marker)[0]
+    cleaned, _ = _parse_send_document(cleaned)
+    cleaned, _ = _parse_inline_buttons(cleaned)
+    cleaned = re.sub(r"inline_button(?:_row)?::[^\n]+", "", cleaned)
+    return cleaned.strip() or "(пустой ответ)"
+
+
+def _truncate_telegram(text: str, limit: int = 4096) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
+
+
+def _build_external_prompt(user_id: int, query: str, *, source: str) -> tuple[str, Path]:
+    """Промпт для guest/inline — ответ для чужого чата, без самомодификации."""
+    session_key = _guest_session_key(user_id)
+    parts: list[str] = []
+    default_prompt = _get_default_prompt()
+    if not has_agent_session(session_key) and default_prompt:
+        parts.append(default_prompt)
+    user_prompt = _get_user_prompt(user_id)
+    if user_prompt:
+        parts.append(f"[Информация от пользователя]\n{user_prompt}\n[/Информация от пользователя]")
+    parts.append(
+        f"[{source}]\n"
+        "Пользователь задал вопрос в переписке с другим человеком. "
+        "Ответь кратко, понятно и по делу — его увидят оба собеседника. "
+        "Не меняй код бота и не используй служебные директивы.\n"
+        f"Вопрос: {query}"
+    )
+    return "\n\n".join(parts), WORKSPACE_DIR
+
+
+async def _run_external_agent(user_id: int, query: str, *, source: str) -> tuple[str, bool]:
+    prompt, agent_cwd = _build_external_prompt(user_id, query, source=source)
+    response, success = await run_cursor_agent_streaming(
+        prompt,
+        agent_cwd,
+        session_key=_guest_session_key(user_id),
+        status_msg=None,
+    )
+    return _truncate_telegram(_clean_external_response(response)), success
+
+
+def _make_article_result(result_id: str, title: str, text: str) -> InlineQueryResultArticle:
+    return InlineQueryResultArticle(
+        id=result_id,
+        title=title[:64],
+        description=title[:128] if len(title) > 64 else None,
+        input_message_content=InputTextMessageContent(
+            message_text=_balance_html_tags(_truncate_telegram(text)),
+            parse_mode=ParseMode.HTML,
+        ),
+    )
+
+
 def _format_user_info(user) -> str:
     """Форматирует информацию о пользователе для отправки."""
     parts = [
@@ -1098,6 +1183,9 @@ async def cmd_start(message: Message) -> None:
         f"{user_info}\n\n"
         "Отправь сообщение — я передам его Cursor Agent и пришлю ответ.\n"
         "Контекст сохраняется между сообщениями.\n\n"
+        "<b>В любом чате (в т.ч. с друзьями):</b>\n"
+        "• Упомяни @бота в сообщении (Guest Mode)\n"
+        "• Или набери @бота в поле ввода и выбери результат (Inline Mode)\n\n"
         "<b>Команды:</b>\n"
         "/start — это сообщение\n"
         "/new — сбросить контекст, начать новый диалог\n"
@@ -1171,6 +1259,10 @@ async def cmd_help(message: Message) -> None:
         '• "Найди баги в main.py"\n'
         '• "Добавь обработку ошибок в api"\n'
         '• "Объясни что делает функция parse"\n\n'
+        "<b>В переписке с кем угодно:</b>\n"
+        "• @бот что такое дуги на брекитах — Guest Mode (ответ прямо в чат)\n"
+        "• @бот в поле ввода → выбрать результат — Inline Mode\n"
+        "Нужно включить Guest Mode и Inline Mode в @BotFather.\n\n"
         "Системные команды: /cd, /pwd, /ls, /mkdir, /cat, /rm\n\n"
         "Обновление бота — напиши «бурмалда» в сообщении, бот сам поймёт нужна ли правка кода.\n"
         "/self_fix [описание] — принудительное самоисправление (без кодового слова)\n"
@@ -1755,6 +1847,114 @@ async def handle_video(message: Message) -> None:
         await message.answer(f"⛔ Не удалось сохранить видео: {e}")
 
 
+@dp.guest_message(F.text)
+async def handle_guest_message(message: Message) -> None:
+    """Guest Mode: @бот вопрос в любом чате (даже без добавления бота)."""
+    if not message.from_user or not is_allowed(message.from_user.id):
+        return
+    guest_query_id = message.guest_query_id
+    if not guest_query_id:
+        return
+
+    query = _strip_bot_mention(message.text or "")
+    if not query:
+        await message.bot.answer_guest_query(
+            guest_query_id,
+            _make_article_result("empty", "Пустой запрос", "Напиши вопрос после @бота"),
+        )
+        return
+
+    answer, success = await _run_external_agent(
+        message.from_user.id, query, source="Guest Mode"
+    )
+    if not success:
+        answer = f"⛔ {answer}"
+
+    try:
+        await message.bot.answer_guest_query(
+            guest_query_id,
+            _make_article_result("answer", query[:64], answer),
+        )
+    except TelegramBadRequest as e:
+        logger.warning("answer_guest_query failed: %s", e)
+
+
+@dp.inline_query()
+async def handle_inline_query(inline_query: InlineQuery) -> None:
+    """Inline Mode: @бот вопрос в поле ввода любого чата."""
+    if not inline_query.from_user or not is_allowed(inline_query.from_user.id):
+        await inline_query.answer([], cache_time=1, is_personal=True)
+        return
+
+    query = (inline_query.query or "").strip()
+    if not query:
+        await inline_query.answer(
+            [
+                _make_article_result(
+                    "hint",
+                    "Задай вопрос",
+                    "Напиши вопрос после @бота, например: что такое дуги на брекитах",
+                )
+            ],
+            cache_time=1,
+            is_personal=True,
+        )
+        return
+
+    result_id = uuid.uuid4().hex
+    _pending_inline[result_id] = (query, inline_query.from_user.id)
+    await inline_query.answer(
+        [
+            _make_article_result(
+                result_id,
+                query[:64],
+                f"⏳ Думаю над: {html.escape(query[:200])}",
+            )
+        ],
+        cache_time=0,
+        is_personal=True,
+    )
+
+
+@dp.chosen_inline_result()
+async def handle_chosen_inline_result(chosen: ChosenInlineResult) -> None:
+    """Догенерация ответа после выбора inline-результата."""
+    if not chosen.from_user or not is_allowed(chosen.from_user.id):
+        return
+    pending = _pending_inline.pop(chosen.result_id, None)
+    if not pending:
+        return
+    query, user_id = pending
+    inline_message_id = chosen.inline_message_id
+
+    if inline_message_id:
+        try:
+            await chosen.bot.edit_message_text(
+                "⏳ Генерирую ответ...",
+                inline_message_id=inline_message_id,
+            )
+        except TelegramBadRequest:
+            pass
+
+    answer, success = await _run_external_agent(user_id, query, source="Inline Mode")
+    if not success:
+        answer = f"⛔ {answer}"
+    answer = _balance_html_tags(answer)
+
+    if inline_message_id:
+        try:
+            await chosen.bot.edit_message_text(
+                answer,
+                inline_message_id=inline_message_id,
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        except TelegramBadRequest:
+            answer = _strip_html_tags(answer)
+
+    await _deliver_agent_text(chosen.bot, chosen.from_user.id, answer)
+
+
 @dp.message(F.text)
 async def handle_message(message: Message) -> None:
     """Фолбэк: если батчинг выключен или не сработал."""
@@ -1845,6 +2045,10 @@ async def main() -> None:
         default=DefaultBotProperties(parse_mode=ParseMode.HTML, link_preview_is_disabled=True),
     )
 
+    global _bot_username
+    me = await bot.get_me()
+    _bot_username = me.username
+
     # Меню команд (подсказки при вводе /)
     await bot.set_my_commands(
         [
@@ -1885,9 +2089,12 @@ async def main() -> None:
 
     await _notify_after_restart(bot)
     start_scheduler(bot, _run_headless_agent, _deliver_agent_text)
-    logger.info("Бот запущен")
+    logger.info("Бот запущен (@%s)", _bot_username or "?")
     try:
-        await dp.start_polling(bot)
+        await dp.start_polling(
+            bot,
+            allowed_updates=dp.resolve_used_update_types(),
+        )
     finally:
         if session is not None:
             await session.close()
