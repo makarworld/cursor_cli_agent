@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import time
 import traceback
 import uuid
@@ -103,6 +104,7 @@ FILES_DIR = WORKSPACE_DIR / "files"
 CURSOR_CLI_PATH = os.getenv("CURSOR_CLI_PATH", "cursor-agent")
 CURSOR_MODEL = os.getenv("CURSOR_MODEL", "auto")
 CURSOR_API_KEY = os.getenv("CURSOR_API_KEY")
+MEM0_API_KEY = os.getenv("MEM0_API_KEY", "").strip()
 CURSOR_TIMEOUT = int(os.getenv("CURSOR_TIMEOUT_SECONDS", "300"))
 MAX_RESPONSE_LENGTH = 4000  # Лимит Telegram
 USER_PROMPTS_FILE = Path(os.getenv("USER_PROMPTS_FILE", "/workspace/.bot/user_prompts.json"))
@@ -118,6 +120,19 @@ _RESTART_NOTIFY_TEXT = (
     '✅ <b>Бот перезапущен</b> и снова на связи! '
     '<tg-emoji emoji-id="5377809374016192785">🐱</tg-emoji>'
 )
+
+
+def _ensure_mcp_config() -> None:
+    """Копирует mcp.json из workspace в ~/.cursor для cursor-agent."""
+    src = WORKSPACE_DIR / ".cursor" / "mcp.json"
+    if not src.is_file():
+        return
+    dst_dir = Path.home() / ".cursor"
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    dst = dst_dir / "mcp.json"
+    if not dst.exists() or src.read_bytes() != dst.read_bytes():
+        shutil.copy2(src, dst)
+        logger.info("MCP config synced: %s -> %s", src, dst)
 
 
 def _format_commit_push_notes(committed: bool, commit_msg: str, commit_result: str) -> str:
@@ -1214,6 +1229,7 @@ async def cmd_status(message: Message) -> None:
         return
 
     has_key = "✅" if CURSOR_API_KEY else "❌"
+    has_mem0 = "✅" if MEM0_API_KEY else "❌"
     workspace_exists = "✅" if WORKSPACE_DIR.exists() else "❌"
     self_mod = "✅" if self_modify_enabled() else "❌"
     git_ok = "✅" if repo_ready() else "❌"
@@ -1221,6 +1237,7 @@ async def cmd_status(message: Message) -> None:
     await message.answer(
         f"📊 <b>Статус</b>\n\n"
         f"CURSOR_API_KEY: {has_key}\n"
+        f"MEM0_API_KEY: {has_mem0}\n"
         f"Рабочая директория: {workspace_exists} (<code>{WORKSPACE_DIR}</code>)\n"
         f"Cursor CLI: <code>{CURSOR_CLI_PATH}</code>\n"
         f"Модель: <code>{CURSOR_MODEL}</code>\n"
@@ -2035,6 +2052,7 @@ async def main() -> None:
 
     WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
     FILES_DIR.mkdir(parents=True, exist_ok=True)
+    _ensure_mcp_config()
     load_agent_sessions()
     _load_user_prompts()
 
