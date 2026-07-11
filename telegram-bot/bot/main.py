@@ -1100,6 +1100,58 @@ def _guest_session_key(user_id: int) -> str:
     return f"guest:{user_id}"
 
 
+_GUEST_RESET_RE = re.compile(r"(?:^|\s)/?(?:new|reset|сброс)(?:\s|$)", re.I)
+
+
+def _display_name(entity) -> str:
+    """Имя User или Chat (first_name / title / username)."""
+    if not entity:
+        return "неизвестно"
+    parts: list[str] = []
+    if getattr(entity, "first_name", None):
+        parts.append(entity.first_name)
+    if getattr(entity, "last_name", None):
+        parts.append(entity.last_name)
+    name = " ".join(parts).strip()
+    username = getattr(entity, "username", None)
+    if username:
+        name = f"{name} (@{username})" if name else f"@{username}"
+    if name:
+        return name
+    title = getattr(entity, "title", None)
+    if title:
+        return title
+    return f"id:{entity.id}"
+
+
+def _format_guest_chat_context(message: Message) -> str:
+    """Контекст чата для Guest Mode: кто спросил и с кем переписка."""
+    lines: list[str] = []
+    asker = message.from_user
+    if asker:
+        lines.append(f"Спросил: {_display_name(asker)}")
+
+    chat = message.chat
+    if chat:
+        if chat.type == "private" and asker and chat.id != asker.id:
+            lines.append(f"Собеседник в переписке: {_display_name(chat)}")
+        elif chat.type in ("group", "supergroup"):
+            lines.append(f"Групповой чат: {_display_name(chat)}")
+        elif chat.type == "private":
+            lines.append("Чат: личная переписка")
+
+    reply = message.reply_to_message
+    if reply and reply.from_user:
+        lines.append(f"Ответ на сообщение от: {_display_name(reply.from_user)}")
+
+    return "\n".join(lines)
+
+
+def _is_guest_reset_query(text: str) -> bool:
+    """Сброс guest-контекста: кодовое слово + /new (или reset/сброс)."""
+    return has_codeword(text) and bool(_GUEST_RESET_RE.search(text))
+
+
 def _strip_bot_mention(text: str) -> str:
     """Убирает @username бота из текста."""
     if not text:
@@ -1127,7 +1179,13 @@ def _truncate_telegram(text: str, limit: int = 4096) -> str:
     return text[: limit - 3] + "..."
 
 
-def _build_external_prompt(user_id: int, query: str, *, source: str) -> tuple[str, Path]:
+def _build_external_prompt(
+    user_id: int,
+    query: str,
+    *,
+    source: str,
+    chat_context: str = "",
+) -> tuple[str, Path]:
     """Промпт для guest/inline — ответ для чужого чата, без самомодификации."""
     session_key = _guest_session_key(user_id)
     parts: list[str] = []
@@ -1137,18 +1195,29 @@ def _build_external_prompt(user_id: int, query: str, *, source: str) -> tuple[st
     user_prompt = _get_user_prompt(user_id)
     if user_prompt:
         parts.append(f"[Информация от пользователя]\n{user_prompt}\n[/Информация от пользователя]")
+    if chat_context:
+        parts.append(f"[Контекст чата]\n{chat_context}\n[/Контекст чата]")
     parts.append(
         f"[{source}]\n"
         "Пользователь задал вопрос в переписке с другим человеком. "
         "Ответь кратко, понятно и по делу — его увидят оба собеседника. "
+        "Учитывай имена из контекста чата, если они указаны. "
         "Не меняй код бота и не используй служебные директивы.\n"
         f"Вопрос: {query}"
     )
     return "\n\n".join(parts), WORKSPACE_DIR
 
 
-async def _run_external_agent(user_id: int, query: str, *, source: str) -> tuple[str, bool]:
-    prompt, agent_cwd = _build_external_prompt(user_id, query, source=source)
+async def _run_external_agent(
+    user_id: int,
+    query: str,
+    *,
+    source: str,
+    chat_context: str = "",
+) -> tuple[str, bool]:
+    prompt, agent_cwd = _build_external_prompt(
+        user_id, query, source=source, chat_context=chat_context
+    )
     response, success = await run_cursor_agent_streaming(
         prompt,
         agent_cwd,
@@ -1200,7 +1269,8 @@ async def cmd_start(message: Message) -> None:
         "Контекст сохраняется между сообщениями.\n\n"
         "<b>В любом чате (в т.ч. с друзьями):</b>\n"
         "• Упомяни @бота в сообщении (Guest Mode)\n"
-        "• Или набери @бота в поле ввода и выбери результат (Inline Mode)\n\n"
+        "• Или набери @бота в поле ввода и выбери результат (Inline Mode)\n"
+        "• @бот бурмалда /new — сброс контекста Guest Mode в переписке\n\n"
         "<b>Команды:</b>\n"
         "/start — это сообщение\n"
         "/new — сбросить контекст, начать новый диалог\n"
@@ -1258,8 +1328,9 @@ async def cmd_new(message: Message) -> None:
         return
 
     clear_chat_id(user_session_key(message.from_user.id))
+    clear_chat_id(_guest_session_key(message.from_user.id))
     await message.answer(
-        "🔄 Контекст сброшен. Следующее сообщение начнёт новый диалог.",
+        "🔄 Контекст сброшен (личный и Guest Mode). Следующее сообщение начнёт новый диалог.",
     )
 
 
@@ -1278,6 +1349,7 @@ async def cmd_help(message: Message) -> None:
         '• "Объясни что делает функция parse"\n\n'
         "<b>В переписке с кем угодно:</b>\n"
         "• @бот что такое дуги на брекитах — Guest Mode (ответ прямо в чат)\n"
+        "• @бот бурмалда /new — сброс контекста Guest Mode в переписке\n"
         "• @бот в поле ввода → выбрать результат — Inline Mode\n"
         "Нужно включить Guest Mode и Inline Mode в @BotFather.\n\n"
         "Системные команды: /cd, /pwd, /ls, /mkdir, /cat, /rm\n\n"
@@ -1881,8 +1953,26 @@ async def handle_guest_message(message: Message) -> None:
         )
         return
 
+    if _is_guest_reset_query(query):
+        clear_chat_id(_guest_session_key(message.from_user.id))
+        words = " или ".join(f"«{w}»" for w in SELF_MODIFY_CODEWORDS[:2])
+        try:
+            await message.bot.answer_guest_query(
+                guest_query_id,
+                _make_article_result(
+                    "reset",
+                    "Контекст сброшен",
+                    f"🔄 Guest Mode: контекст сброшен. Следующий вопрос — новый диалог.\n"
+                    f"(Нужны {words} + /new)",
+                ),
+            )
+        except TelegramBadRequest as e:
+            logger.warning("answer_guest_query reset failed: %s", e)
+        return
+
+    chat_context = _format_guest_chat_context(message)
     answer, success = await _run_external_agent(
-        message.from_user.id, query, source="Guest Mode"
+        message.from_user.id, query, source="Guest Mode", chat_context=chat_context
     )
     if not success:
         answer = f"⛔ {answer}"
