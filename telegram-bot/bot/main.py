@@ -1270,7 +1270,7 @@ async def cmd_start(message: Message) -> None:
         "<b>В любом чате (в т.ч. с друзьями):</b>\n"
         "• Упомяни @бота в сообщении (Guest Mode)\n"
         "• Или набери @бота в поле ввода и выбери результат (Inline Mode)\n"
-        "• @бот бурмалда /new — сброс контекста Guest Mode в переписке\n\n"
+        "• @бот /new бурмалда — сброс контекста Guest Mode в переписке\n\n"
         "<b>Команды:</b>\n"
         "/start — это сообщение\n"
         "/new — сбросить контекст, начать новый диалог\n"
@@ -1328,9 +1328,8 @@ async def cmd_new(message: Message) -> None:
         return
 
     clear_chat_id(user_session_key(message.from_user.id))
-    clear_chat_id(_guest_session_key(message.from_user.id))
     await message.answer(
-        "🔄 Контекст сброшен (личный и Guest Mode). Следующее сообщение начнёт новый диалог.",
+        "🔄 Контекст сброшен. Следующее сообщение начнёт новый диалог.",
     )
 
 
@@ -1349,7 +1348,7 @@ async def cmd_help(message: Message) -> None:
         '• "Объясни что делает функция parse"\n\n'
         "<b>В переписке с кем угодно:</b>\n"
         "• @бот что такое дуги на брекитах — Guest Mode (ответ прямо в чат)\n"
-        "• @бот бурмалда /new — сброс контекста Guest Mode в переписке\n"
+        "• @бот /new бурмалда — сброс контекста Guest Mode в переписке\n"
         "• @бот в поле ввода → выбрать результат — Inline Mode\n"
         "Нужно включить Guest Mode и Inline Mode в @BotFather.\n\n"
         "Системные команды: /cd, /pwd, /ls, /mkdir, /cat, /rm\n\n"
@@ -1955,15 +1954,13 @@ async def handle_guest_message(message: Message) -> None:
 
     if _is_guest_reset_query(query):
         clear_chat_id(_guest_session_key(message.from_user.id))
-        words = " или ".join(f"«{w}»" for w in SELF_MODIFY_CODEWORDS[:2])
         try:
             await message.bot.answer_guest_query(
                 guest_query_id,
                 _make_article_result(
                     "reset",
                     "Контекст сброшен",
-                    f"🔄 Guest Mode: контекст сброшен. Следующий вопрос — новый диалог.\n"
-                    f"(Нужны {words} + /new)",
+                    "🔄 Guest Mode: контекст сброшен. Следующий вопрос — новый диалог.",
                 ),
             )
         except TelegramBadRequest as e:
