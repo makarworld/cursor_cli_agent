@@ -1270,10 +1270,12 @@ async def cmd_start(message: Message) -> None:
         "<b>В любом чате (в т.ч. с друзьями):</b>\n"
         "• Упомяни @бота в сообщении (Guest Mode)\n"
         "• Или набери @бота в поле ввода и выбери результат (Inline Mode)\n"
-        "• @бот /new — сброс контекста Guest Mode в переписке\n\n"
+        "• @бот /new — сброс контекста Guest Mode в переписке\n"
+        "• /new_guest — то же, но из лички с ботом\n\n"
         "<b>Команды:</b>\n"
         "/start — это сообщение\n"
         "/new — сбросить контекст, начать новый диалог\n"
+        "/new_guest — сбросить контекст Guest Mode (переписки с друзьями)\n"
         "/status — проверка подключения\n"
         "/help — справка\n"
         "/set_prompt — задать свой промпт для агента\n"
@@ -1333,6 +1335,19 @@ async def cmd_new(message: Message) -> None:
     )
 
 
+@dp.message(Command("new_guest"))
+async def cmd_new_guest(message: Message) -> None:
+    """Команда /new_guest — сброс guest-контекста (Guest Mode в переписках)."""
+    if not is_allowed(message.from_user.id):
+        await message.answer("⛔ Доступ запрещён.")
+        return
+
+    clear_chat_id(_guest_session_key(message.from_user.id))
+    await message.answer(
+        "🔄 Guest Mode: контекст сброшен. Следующий @бот в переписке — новый диалог.",
+    )
+
+
 @dp.message(Command("help"))
 async def cmd_help(message: Message) -> None:
     """Команда /help."""
@@ -1349,6 +1364,7 @@ async def cmd_help(message: Message) -> None:
         "<b>В переписке с кем угодно:</b>\n"
         "• @бот что такое дуги на брекитах — Guest Mode (ответ прямо в чат)\n"
         "• @бот /new — сброс контекста Guest Mode в переписке\n"
+        "• /new_guest — сброс Guest Mode из лички с ботом\n"
         "• @бот в поле ввода → выбрать результат — Inline Mode\n"
         "Нужно включить Guest Mode и Inline Mode в @BotFather.\n\n"
         "Системные команды: /cd, /pwd, /ls, /mkdir, /cat, /rm\n\n"
@@ -2160,6 +2176,7 @@ async def main() -> None:
             BotCommand(command="start", description="Приветствие и твой ID"),
             BotCommand(command="help", description="Справка по боту"),
             BotCommand(command="new", description="Сбросить контекст чата"),
+            BotCommand(command="new_guest", description="Сбросить контекст Guest Mode"),
             BotCommand(command="status", description="Проверка подключения"),
             BotCommand(command="set_prompt", description="Задать свой промпт"),
             BotCommand(command="myprompt", description="Показать свой промпт"),
