@@ -1089,11 +1089,25 @@ async def _run_self_fix(
         )
 
 
+def _load_allowed_user_ids() -> list[int]:
+    """Актуальный ALLOWED_USER_IDS из .env (чтобы выдача доступа работала без docker recreate)."""
+    env_path = WORKSPACE_DIR / "cursor_cli_agent" / ".env"
+    raw = os.getenv("ALLOWED_USER_IDS", "")
+    if env_path.is_file():
+        for line in env_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            s = line.strip()
+            if s.startswith("ALLOWED_USER_IDS="):
+                raw = s.split("=", 1)[1].strip().strip('"').strip("'")
+                break
+    return [int(x.strip()) for x in raw.split(",") if x.strip()]
+
+
 def is_allowed(user_id: int) -> bool:
     """Проверка доступа пользователя."""
-    if not ALLOWED_USER_IDS:
+    ids = _load_allowed_user_ids()
+    if not ids:
         return True
-    return user_id in ALLOWED_USER_IDS
+    return user_id in ids
 
 
 def _guest_session_key(user_id: int) -> str:
