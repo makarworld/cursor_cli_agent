@@ -44,6 +44,9 @@ services:
       - CURSOR_MODEL=${CURSOR_MODEL:-auto}
       - CURSOR_API_KEY=${CURSOR_API_KEY}
       - CURSOR_TIMEOUT_SECONDS=${CURSOR_TIMEOUT_SECONDS:-300}
+      - CONTEXT7_API_KEY=${CONTEXT7_API_KEY:-}
+      - ZREAD_API_KEY=${ZREAD_API_KEY:-}
+      - MEM0_API_KEY=${MEM0_API_KEY:-}
       # Самомодификация бота
       - SELF_MODIFY_ENABLED=${SELF_MODIFY_ENABLED:-true}
       - SELF_MODIFY_AUTO_FIX=${SELF_MODIFY_AUTO_FIX:-true}
@@ -53,6 +56,11 @@ services:
       - BOT_SOURCE_DIR=/app
       - GIT_USER_NAME=${GIT_USER_NAME:-cursor-telegram-bot}
       - GIT_USER_EMAIL=${GIT_USER_EMAIL:-bot@cursor-cli-agent.local}
+      - SCHEDULER_ENABLED=${SCHEDULER_ENABLED:-true}
+      - SCHEDULER_POLL_INTERVAL_SECONDS=${SCHEDULER_POLL_INTERVAL_SECONDS:-30}
+      - SCHEDULER_DB_PATH=${SCHEDULER_DB_PATH:-/workspace/.bot/scheduler.db}
+      - MESSAGE_BATCH_ENABLED=${MESSAGE_BATCH_ENABLED:-true}
+      - MESSAGE_BATCH_WINDOW_SECONDS=${MESSAGE_BATCH_WINDOW_SECONDS:-2.5}
     volumes:
       # Общая рабочая директория с CloudCLI
       - cursor-workspace:/workspace
