@@ -5,3 +5,5 @@ __pycache__
 .venv
 venv
 задача.txt
+# Хост-папка проектов (/workspace в контейнере) — не пушить в GitHub
+workspace/

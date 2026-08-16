@@ -20,8 +20,8 @@ services:
       - NODE_ENV=production
       - CURSOR_API_KEY=${CURSOR_API_KEY}
     volumes:
-      # Рабочая директория для проектов (Cursor CLI)
-      - cursor-workspace:/workspace
+      # Рабочая директория на хосте (папка в .gitignore — не уходит в GitHub)
+      - ${WORKSPACE_HOST_PATH:-./workspace}:/workspace
       # Данные CloudCLI (сессии, БД)
       - cloudcli-data:/app/data
   # =============================================================================
@@ -56,14 +56,17 @@ services:
       - BOT_SOURCE_DIR=/app
       - GIT_USER_NAME=${GIT_USER_NAME:-cursor-telegram-bot}
       - GIT_USER_EMAIL=${GIT_USER_EMAIL:-bot@cursor-cli-agent.local}
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
       - SCHEDULER_ENABLED=${SCHEDULER_ENABLED:-true}
       - SCHEDULER_POLL_INTERVAL_SECONDS=${SCHEDULER_POLL_INTERVAL_SECONDS:-30}
       - SCHEDULER_DB_PATH=${SCHEDULER_DB_PATH:-/workspace/.bot/scheduler.db}
       - MESSAGE_BATCH_ENABLED=${MESSAGE_BATCH_ENABLED:-true}
       - MESSAGE_BATCH_WINDOW_SECONDS=${MESSAGE_BATCH_WINDOW_SECONDS:-2.5}
+      - TODOIST_API_KEY=${TODOIST_API_KEY:-}
+      - TODOIST_SYNC_CHAT_ID=${TODOIST_SYNC_CHAT_ID:-}
     volumes:
-      # Общая рабочая директория с CloudCLI
-      - cursor-workspace:/workspace
+      # Общая рабочая директория с CloudCLI (хост-папка, см. WORKSPACE_HOST_PATH)
+      - ${WORKSPACE_HOST_PATH:-./workspace}:/workspace
       # Репозиторий для git-коммитов при самомодификации
       - .:/workspace/cursor_cli_agent
       # Live-код бота (правки применяются без пересборки образа)
@@ -74,8 +77,6 @@ services:
       - .env
 
 volumes:
-  cursor-workspace:
-    driver: local
   cloudcli-data:
     driver: local
   cursor-sessions:

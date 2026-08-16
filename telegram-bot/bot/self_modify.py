@@ -45,6 +45,10 @@ GIT_PUSH_TIMEOUT = int(os.getenv("GIT_PUSH_TIMEOUT_SECONDS", "120"))
 BOT_CODE_GLOBS = ("bot/**/*.py", "default_prompt.txt", "requirements.txt")
 
 
+def _github_token() -> str:
+    return (os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN") or "").strip()
+
+
 def is_enabled() -> bool:
     return SELF_MODIFY_ENABLED
 
@@ -119,6 +123,7 @@ def _run_git(
     cwd: Path | None = None,
     *,
     timeout: int = 60,
+    github_auth: bool = False,
 ) -> tuple[int, str, str]:
     repo = cwd or BOT_REPO_DIR
     env = os.environ.copy()
@@ -126,6 +131,13 @@ def _run_git(
     env.setdefault("GIT_COMMITTER_NAME", GIT_USER_NAME)
     env.setdefault("GIT_AUTHOR_EMAIL", GIT_USER_EMAIL)
     env.setdefault("GIT_COMMITTER_EMAIL", GIT_USER_EMAIL)
+    # ponytail: token только на push; insteadOf чтобы не трогать remote URL
+    if github_auth:
+        token = _github_token()
+        if token:
+            env["GIT_CONFIG_COUNT"] = "1"
+            env["GIT_CONFIG_KEY_0"] = f"url.https://x-access-token:{token}@github.com/.insteadOf"
+            env["GIT_CONFIG_VALUE_0"] = "https://github.com/"
 
     try:
         result = subprocess.run(
@@ -210,14 +222,18 @@ def git_push() -> tuple[bool, str]:
         return False, "Push отключён (SELF_MODIFY_GIT_PUSH=false)"
     if not repo_ready():
         return False, f"Git-репозиторий не найден: {BOT_REPO_DIR}"
+    if not _github_token():
+        return False, "GITHUB_TOKEN не задан — push невозможен"
 
     code, branch, err = _run_git(["rev-parse", "--abbrev-ref", "HEAD"])
     if code != 0 or not branch:
         return False, err or "Не удалось определить ветку"
 
-    code, out, err = _run_git(["push", "origin", branch], timeout=GIT_PUSH_TIMEOUT)
+    code, out, err = _run_git(
+        ["push", "origin", branch], timeout=GIT_PUSH_TIMEOUT, github_auth=True
+    )
     if code != 0:
-        code, out2, err2 = _run_git(["push"], timeout=GIT_PUSH_TIMEOUT)
+        code, out2, err2 = _run_git(["push"], timeout=GIT_PUSH_TIMEOUT, github_auth=True)
         if code != 0:
             detail = err2 or out2 or err or out or "git push failed"
             return False, detail
