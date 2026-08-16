@@ -50,11 +50,12 @@ from .batch_middleware import MessageBatchMiddleware, setup_message_batch
 from .scheduler import (
     SCHEDULER_ENABLED,
     cancel_event,
-    create_event,
-    format_event_line,
+    create_linked_reminder,
+    format_reminders_grouped,
     list_events,
     start_scheduler,
 )
+from .todoist_client import TodoistError
 from .self_modify import (
     SELF_MODIFY_AUTO_FIX,
     SELF_MODIFY_CODEWORDS,
@@ -243,8 +244,8 @@ def _parse_schedule_reminders(
     chat_id: int,
 ) -> tuple[str, list[str]]:
     """
-    Извлекает schedule_reminder::ISO_DATETIME::заголовок::контекст из текста агента.
-    Создаёт записи в БД. Возвращает (текст без директив, список подтверждений).
+    Извлекает schedule_reminder::ISO_DATETIME::заголовок::контекст.
+    Время = начало события; Todoist + TG-пинги −5ч/−1ч.
     """
     if not SCHEDULER_ENABLED:
         return text, []
@@ -263,10 +264,20 @@ def _parse_schedule_reminders(
         dt_str, title = parts[0].strip(), parts[1].strip()
         body = parts[2].strip() if len(parts) > 2 else ""
         try:
-            remind_at = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
-            event = create_event(user_id, chat_id, title, remind_at, body)
-            at_fmt = event.remind_at.strftime("%d.%m.%Y %H:%M UTC")
-            confirmations.append(f"⏰ Напоминание #{event.id} на {at_fmt}: {title}")
+            starts_at = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+            if starts_at.tzinfo is not None:
+                starts_at = starts_at.astimezone(timezone.utc).replace(tzinfo=None)
+            events = create_linked_reminder(user_id, chat_id, title, starts_at, body)
+            at_fmt = starts_at.strftime("%d.%m.%Y %H:%M UTC")
+            if not events:
+                confirmations.append(
+                    f"⏰ Todoist: {title} (начало {at_fmt}) — TG-пинг пропущен (зубы/таблетки или оба offset в прошлом)"
+                )
+            else:
+                ids = ", ".join(f"#{e.id}" for e in events)
+                confirmations.append(
+                    f"⏰ Todoist + пинги в TG за 5ч и за 1ч до {at_fmt}: {title} ({ids})"
+                )
         except Exception as e:
             logger.warning("Не удалось создать напоминание: %s — %s", rest[:80], e)
             confirmations.append(f"⛔ Не удалось запланировать: {title or dt_str} ({e})")
@@ -1301,7 +1312,7 @@ async def cmd_start(message: Message) -> None:
         "/bot_git_status — статус git (изменения бота)\n"
         "/bot_git_log — последние коммиты бота\n"
         "/bot_rollback — откатить последний коммит бота\n"
-        "/remind &lt;когда&gt; &lt;текст&gt; — напоминание напрямую\n"
+        "/remind &lt;начало&gt; &lt;текст&gt; — событие в Todoist + пинги TG −5ч/−1ч\n"
         "/reminders — список запланированных напоминаний\n"
         "/cancel_reminder &lt;id&gt; — отменить напоминание",
     )
@@ -1387,8 +1398,8 @@ async def cmd_help(message: Message) -> None:
         "/bot_git_status — изменения в git\n"
         "/bot_git_log — история коммитов\n"
         "/bot_rollback [N] — откат N коммитов\n\n"
-        "Напоминания: «напомни мне завтра в 10 про ...» или команда /remind.\n"
-        "Примеры: /remind +30m выпить воды | /remind 2025-06-09 10:00 деплой\n"
+        "Напоминания: Todoist + пинги в TG за 5ч и за 1ч до начала.\n"
+        "Примеры: /remind 2025-06-09 15:00 деплой | «напомни завтра в 10 про ...»\n"
         "/reminders — список, /cancel_reminder &lt;id&gt; — отмена",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -1450,21 +1461,33 @@ async def cmd_remind(message: Message, command: CommandObject) -> None:
     if not parsed:
         await message.answer(
             "Использование:\n"
-            "<code>/remind +30m текст</code>\n"
-            "<code>/remind +2h текст</code>\n"
-            "<code>/remind 2025-06-09 10:00 текст</code>\n"
-            "<code>/remind 09.06.2025 10:00 текст</code>\n\n"
-            "Время — UTC. Или просто напиши «напомни мне ...»"
+            "<code>/remind +6h текст</code>\n"
+            "<code>/remind 2025-06-09 15:00 текст</code>\n"
+            "<code>/remind 09.06.2025 15:00 текст</code>\n\n"
+            "Время = начало события (UTC). В TG уйдут пинги за 5ч и за 1ч "
+            "(если эти моменты ещё в будущем). Нужен TODOIST_API_KEY."
         )
         return
 
-    remind_at, title = parsed
+    starts_at, title = parsed
     try:
-        event = create_event(message.from_user.id, message.chat.id, title, remind_at)
-        at_fmt = event.remind_at.strftime("%d.%m.%Y %H:%M UTC")
-        await message.answer(
-            f"⏰ Напоминание <code>#{event.id}</code> на {at_fmt}:\n{html.escape(title)}"
+        events = create_linked_reminder(
+            message.from_user.id, message.chat.id, title, starts_at
         )
+        at_fmt = starts_at.strftime("%d.%m.%Y %H:%M UTC")
+        if not events:
+            await message.answer(
+                f"⏰ Todoist: <b>{html.escape(title)}</b> (начало {at_fmt})\n"
+                "TG-пинг пропущен (зубы/таблетки или оба offset уже в прошлом)."
+            )
+        else:
+            ids = ", ".join(f"<code>#{e.id}</code>" for e in events)
+            await message.answer(
+                f"⏰ Todoist + пинги в TG за 5ч и за 1ч до {at_fmt}:\n"
+                f"{html.escape(title)}\n{ids}"
+            )
+    except TodoistError as e:
+        await message.answer(f"⛔ Todoist: {html.escape(str(e))}")
     except Exception as e:
         await message.answer(f"⛔ Не удалось создать: {html.escape(str(e))}")
 
@@ -1487,15 +1510,13 @@ async def cmd_reminders(message: Message) -> None:
         )
         return
 
-    lines = [format_event_line(e, escape_html=html.escape) for e in events]
-    await message.answer(
-        "⏰ <b>Запланированные напоминания</b>\n\n" + "\n".join(lines)
-    )
+    body = format_reminders_grouped(events, escape_html=html.escape)
+    await message.answer("⏰ <b>Запланированные напоминания</b>\n\n" + body)
 
 
 @dp.message(Command("cancel_reminder"))
 async def cmd_cancel_reminder(message: Message, command: CommandObject) -> None:
-    """Отмена напоминания по ID."""
+    """Отмена напоминания по ID (и siblings + Todoist)."""
     if not is_allowed(message.from_user.id):
         await message.answer("⛔ Доступ запрещён.")
         return
@@ -1510,7 +1531,10 @@ async def cmd_cancel_reminder(message: Message, command: CommandObject) -> None:
 
     event_id = int(args.split()[0])
     if cancel_event(event_id, message.from_user.id):
-        await message.answer(f"🗑 Напоминание <code>#{event_id}</code> отменено.")
+        await message.answer(
+            f"🗑 Напоминание <code>#{event_id}</code> отменено "
+            "(включая парный пинг и задачу в Todoist)."
+        )
     else:
         await message.answer(
             f"⛔ Напоминание <code>#{event_id}</code> не найдено или уже сработало."
@@ -2224,7 +2248,7 @@ async def main() -> None:
     dp.message.middleware(MessageBatchMiddleware())
 
     await _notify_after_restart(bot)
-    start_scheduler(bot, _run_headless_agent, _deliver_agent_text)
+    start_scheduler(bot, _deliver_agent_text)
     logger.info("Бот запущен (@%s)", _bot_username or "?")
     try:
         await dp.start_polling(
