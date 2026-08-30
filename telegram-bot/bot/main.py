@@ -26,6 +26,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import (
     BotCommand,
+    CallbackQuery,
     ChosenInlineResult,
     ErrorEvent,
     FSInputFile,
@@ -116,6 +117,7 @@ dp = Dispatcher()
 
 _bot_username: str | None = None
 _pending_inline: dict[str, tuple[str, int]] = {}
+_active_agent_runs: dict[str, dict] = {}
 _self_fix_lock = asyncio.Lock()
 _RESTART_NOTIFY_TEXT = (
     '✅ <b>Бот перезапущен</b> и снова на связи! '
@@ -830,6 +832,37 @@ def _set_user_prompt(user_id: int, text: str) -> None:
     _save_user_prompts()
 
 
+def _stop_agent_markup(run_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="⏹ Остановить", callback_data=f"stop_agent:{run_id}")]]
+    )
+
+
+def _format_agent_status_text(status_history: list[str]) -> str:
+    if not status_history:
+        return '<tg-emoji emoji-id="5210764626857313664">🤖</tg-emoji> Инициализация...'
+    lines = ["⏳ <b>Действия:</b>"]
+    for item in status_history[-15:]:
+        lines.append(f"• {html.escape(item)}")
+    if len(status_history) > 15:
+        lines.insert(1, f"<i>…ещё {len(status_history) - 15}</i>")
+    return "\n".join(lines)
+
+
+def _format_stopped_response(status_history: list[str], partial_text: str) -> str:
+    parts = ["⏹ <b>Остановлено</b>"]
+    if status_history:
+        parts.append("\n<b>Выполнено:</b>")
+        for item in status_history:
+            parts.append(f"• {html.escape(item)}")
+    else:
+        parts.append("\nДействий не зафиксировано.")
+    text = partial_text.strip()
+    if text:
+        parts.append(f"\n<b>Частичный ответ:</b>\n{text}")
+    return "\n".join(parts)
+
+
 def _parse_stream_status(line: str) -> str | None:
     """Извлекает короткий статус из строки stream-json для отображения в Telegram."""
     try:
@@ -869,15 +902,17 @@ async def run_cursor_agent_streaming(
     *,
     session_key: str | None = None,
     status_msg: Message | None = None,
-) -> tuple[str, bool]:
+    user_id: int | None = None,
+) -> tuple[str, bool, bool]:
     """
     Запускает cursor-agent со stream-json, обновляет status_msg по ходу выполнения.
     session_key — ключ сессии (user:123, scheduler); None — разовый запуск без resume.
-    Возвращает (ответ, успех).
+    Возвращает (ответ, успех, остановлен_пользователем).
     """
     if not CURSOR_API_KEY:
         return (
             "❌ CURSOR_API_KEY не настроен. Добавьте в .env ключ с https://cursor.com/dashboard?tab=background-agents",
+            False,
             False,
         )
 
@@ -893,12 +928,41 @@ async def run_cursor_agent_streaming(
         cmd.extend(["--resume", chat_id])
     cmd.extend(["--print", _sanitize_prompt_for_cli(prompt)])
 
-    last_status = '<tg-emoji emoji-id="5210764626857313664">🤖</tg-emoji> Инициализация...'
-    last_edit_time = [0.0]  # mutable для доступа из вложенной функции
-    STATUS_DEBOUNCE = 2.0  # секунд между обновлениями Telegram
-    assistant_parts: list[str] = []
+    run_id: str | None = None
+    cancelled_evt: asyncio.Event | None = None
+    if status_msg is not None:
+        run_id = uuid.uuid4().hex[:12]
+        cancelled_evt = asyncio.Event()
+        uid = user_id if user_id is not None else status_msg.chat.id
+        _active_agent_runs[run_id] = {
+            "cancelled": cancelled_evt,
+            "proc": None,
+            "user_id": uid,
+            "status_history": [],
+        }
 
-    async def _run() -> tuple[str, bool]:
+    last_edit_time = [0.0]
+    STATUS_DEBOUNCE = 2.0
+    assistant_parts: list[str] = []
+    status_history: list[str] = []
+    was_cancelled = False
+
+    async def _update_status_msg() -> None:
+        if status_msg is None:
+            return
+        now = time.monotonic()
+        if now - last_edit_time[0] < STATUS_DEBOUNCE:
+            return
+        body = _format_agent_status_text(status_history)
+        markup = _stop_agent_markup(run_id) if run_id else None
+        try:
+            await status_msg.edit_text(body, reply_markup=markup)
+            last_edit_time[0] = now
+        except Exception:
+            pass
+
+    async def _run() -> tuple[str, bool, bool]:
+        nonlocal was_cancelled
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             cwd=cwd,
@@ -906,10 +970,27 @@ async def run_cursor_agent_streaming(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
+        if run_id and run_id in _active_agent_runs:
+            _active_agent_runs[run_id]["proc"] = proc
+
+        if status_msg is not None and run_id:
+            try:
+                await status_msg.edit_text(
+                    _format_agent_status_text(status_history),
+                    reply_markup=_stop_agent_markup(run_id),
+                )
+                last_edit_time[0] = time.monotonic()
+            except Exception:
+                pass
 
         assert proc.stdout
         buffer = ""
         while True:
+            if cancelled_evt and cancelled_evt.is_set():
+                was_cancelled = True
+                if proc.returncode is None:
+                    proc.kill()
+                break
             try:
                 chunk = await asyncio.wait_for(proc.stdout.read(4096), timeout=1.0)
             except asyncio.TimeoutError:
@@ -926,15 +1007,11 @@ async def run_cursor_agent_streaming(
                     continue
                 status = _parse_stream_status(line)
                 if status:
-                    last_status = status
-                    if status_msg is not None:
-                        now = time.monotonic()
-                        if now - last_edit_time[0] >= STATUS_DEBOUNCE:
-                            try:
-                                await status_msg.edit_text(f"⏳ {last_status}", parse_mode=None)
-                                last_edit_time[0] = now
-                            except Exception:
-                                pass
+                    if not status_history or status_history[-1] != status:
+                        status_history.append(status)
+                    if run_id and run_id in _active_agent_runs:
+                        _active_agent_runs[run_id]["status_history"] = status_history
+                    await _update_status_msg()
                 try:
                     data = json.loads(line)
                     if data.get("type") == "assistant":
@@ -945,28 +1022,42 @@ async def run_cursor_agent_streaming(
                 except (json.JSONDecodeError, KeyError, TypeError):
                     pass
 
+        if cancelled_evt and cancelled_evt.is_set():
+            was_cancelled = True
+
         stderr = await proc.stderr.read() if proc.stderr else b""
-        await proc.wait()
+        try:
+            await proc.wait()
+        except ProcessLookupError:
+            pass
+
+        if was_cancelled:
+            partial = "".join(assistant_parts).strip()
+            return _format_stopped_response(status_history, partial), False, True
 
         if proc.returncode != 0:
             err = stderr.decode("utf-8", errors="replace")[:500]
-            return f"❌ Ошибка Cursor CLI:\n```\n{err}\n```", False
+            return f"❌ Ошибка Cursor CLI:\n```\n{err}\n```", False, False
 
         output = "".join(assistant_parts).strip() or "(пустой ответ)"
-        return output, True
+        return output, True, False
 
     try:
         return await asyncio.wait_for(_run(), timeout=CURSOR_TIMEOUT)
     except asyncio.TimeoutError:
-        return f"⏱ Превышено время ожидания ({CURSOR_TIMEOUT} сек)", False
+        return f"⏱ Превышено время ожидания ({CURSOR_TIMEOUT} сек)", False, False
     except FileNotFoundError:
         return (
             f"❌ Cursor CLI не найден. Проверьте CURSOR_CLI_PATH (сейчас: {CURSOR_CLI_PATH})",
             False,
+            False,
         )
     except Exception as e:
         logger.exception("Ошибка при вызове cursor-agent")
-        return f"❌ Ошибка: {str(e)}", False
+        return f"❌ Ошибка: {str(e)}", False, False
+    finally:
+        if run_id:
+            _active_agent_runs.pop(run_id, None)
 
 
 async def _finalize_bot_changes(
@@ -1055,12 +1146,17 @@ async def _run_self_fix(
         if not cwd.is_dir():
             cwd = WORKSPACE_DIR
 
-        response, success = await run_cursor_agent_streaming(
+        response, success, cancelled = await run_cursor_agent_streaming(
             prompt,
             cwd,
             session_key=None,
             status_msg=status,
+            user_id=user_id,
         )
+
+        if cancelled:
+            await status.edit_text(response)
+            return
 
         if not success:
             await status.edit_text(f"⛔ Агент не смог исправить:\n<pre>{html.escape(response[:3000])}</pre>")
@@ -1243,7 +1339,7 @@ async def _run_external_agent(
     prompt, agent_cwd = _build_external_prompt(
         user_id, query, source=source, chat_context=chat_context
     )
-    response, success = await run_cursor_agent_streaming(
+    response, success, _ = await run_cursor_agent_streaming(
         prompt,
         agent_cwd,
         session_key=_guest_session_key(user_id),
@@ -1848,12 +1944,17 @@ async def _run_agent_for_user(
         '<tg-emoji emoji-id="5210764626857313664">🤖</tg-emoji> Инициализация...'
     )
 
-    response, success = await run_cursor_agent_streaming(
+    response, success, cancelled = await run_cursor_agent_streaming(
         prompt,
         agent_cwd,
         session_key=user_session_key(user_id),
         status_msg=status_msg,
+        user_id=user_id,
     )
+
+    if cancelled:
+        await _send_response(status_msg, response, message, message.bot)
+        return
 
     remaining_text, schedule_notes = _parse_schedule_reminders(
         response, user_id, message.chat.id
@@ -1893,12 +1994,13 @@ async def _run_headless_agent(prompt: str, user_id: int) -> tuple[str, bool]:
         parts.append(f"[Информация от пользователя]\n{user_prompt}\n[/Информация от пользователя]")
     parts.append(prompt)
     full_prompt = "\n\n".join(parts)
-    return await run_cursor_agent_streaming(
+    response, success, _ = await run_cursor_agent_streaming(
         full_prompt,
         WORKSPACE_DIR,
         session_key=SESSION_KEY_SCHEDULER,
         status_msg=None,
     )
+    return response, success
 
 
 async def _save_telegram_photo(message: Message) -> tuple[Path, str] | None:
@@ -2035,6 +2137,30 @@ async def handle_guest_message(message: Message) -> None:
         )
     except TelegramBadRequest as e:
         logger.warning("answer_guest_query failed: %s", e)
+
+
+@dp.callback_query(F.data.startswith("stop_agent:"))
+async def handle_stop_agent(callback: CallbackQuery) -> None:
+    """Останавливает текущую генерацию агента по inline-кнопке."""
+    if not callback.from_user or not callback.data:
+        await callback.answer()
+        return
+    run_id = callback.data.split(":", 1)[1]
+    run = _active_agent_runs.get(run_id)
+    if not run:
+        await callback.answer("Уже завершено")
+        return
+    if callback.from_user.id != run["user_id"]:
+        await callback.answer("Не твоё")
+        return
+    run["cancelled"].set()
+    proc = run.get("proc")
+    if proc is not None and proc.returncode is None:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+    await callback.answer("Останавливаю...")
 
 
 @dp.inline_query()
