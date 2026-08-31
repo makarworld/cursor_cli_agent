@@ -644,13 +644,16 @@ async def _send_one_message(
     """
     text = _balance_html_tags(text or "(пустой ответ)")
 
-    async def _do_send(body: str, *, use_html: bool = True) -> None:
+    async def _do_send(body: str, *, use_html: bool = True, as_edit: bool | None = None) -> None:
+        use_edit = edit if as_edit is None else as_edit
         kwargs: dict = {}
         if reply_markup is not None:
             kwargs["reply_markup"] = reply_markup
+        elif use_edit:
+            kwargs["reply_markup"] = _CLEAR_REPLY_MARKUP
         if not use_html:
             kwargs["parse_mode"] = None
-        if edit:
+        if use_edit:
             await target.edit_text(body, **kwargs)
         else:
             await message.answer(body, **kwargs)
@@ -660,7 +663,7 @@ async def _send_one_message(
         return True
     except TelegramBadRequest as e:
         err_msg = str(e).lower()
-        if "parse entities" in err_msg or "can't parse" in err_msg:
+        if _is_html_parse_telegram_error(err_msg):
             fixed = _balance_html_tags(text)
             if fixed != text:
                 try:
@@ -674,6 +677,18 @@ async def _send_one_message(
             except TelegramBadRequest:
                 pass
 
+        if edit:
+            for body, use_html in (
+                (text, True),
+                (_balance_html_tags(text), True),
+                (_strip_html_tags(text), False),
+            ):
+                try:
+                    await _do_send(body, use_html=use_html, as_edit=False)
+                    return True
+                except TelegramBadRequest:
+                    continue
+
         err_name = type(e).__name__
         logger.error("Ошибка отправки %s, текст: %s", err_name, text[:500])
         ERROR_REPORTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -686,7 +701,10 @@ async def _send_one_message(
         report_path.write_text(content, encoding="utf-8")
         try:
             if edit:
-                await target.edit_text(f"⛔ Ошибка отправки: {err_name}")
+                await target.edit_text(
+                    f"⛔ Ошибка отправки: {err_name}",
+                    reply_markup=_CLEAR_REPLY_MARKUP,
+                )
             await bot.send_document(
                 chat_id=message.chat.id,
                 document=FSInputFile(report_path, filename=report_path.name),
@@ -759,17 +777,35 @@ async def _send_response(
         chunks = _split_long_text(clean_part)
         for j, chunk in enumerate(chunks):
             markup = reply_markup if j == 0 else None
-            await _send_one_message(
-                status_msg,
-                chunk,
-                message,
-                bot,
-                edit=is_first_send,
-                reply_markup=markup,
-            )
-            if not is_first_send:
+            if is_first_send:
+                sent = await _send_one_message(
+                    status_msg,
+                    chunk,
+                    message,
+                    bot,
+                    edit=True,
+                    reply_markup=markup,
+                )
+                if not sent:
+                    await _send_one_message(
+                        status_msg,
+                        chunk,
+                        message,
+                        bot,
+                        edit=False,
+                        reply_markup=markup,
+                    )
+                is_first_send = False
+            else:
+                await _send_one_message(
+                    status_msg,
+                    chunk,
+                    message,
+                    bot,
+                    edit=False,
+                    reply_markup=markup,
+                )
                 await asyncio.sleep(0.3)
-            is_first_send = False
 
 
 def _load_user_prompts() -> None:
@@ -836,6 +872,52 @@ def _stop_agent_markup(run_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="⏹ Остановить", callback_data=f"stop_agent:{run_id}")]]
     )
+
+
+_CLEAR_REPLY_MARKUP = InlineKeyboardMarkup(inline_keyboard=[])
+
+
+def _is_html_parse_telegram_error(err_msg: str) -> bool:
+    err = err_msg.lower()
+    return any(
+        x in err
+        for x in (
+            "parse entities",
+            "can't parse",
+            "entity_text_invalid",
+            "can't find end tag",
+            "unmatched end tag",
+        )
+    )
+
+
+def _extract_stream_assistant_text(data: dict) -> str:
+    """Текст из assistant-события stream-json."""
+    if data.get("type") != "assistant":
+        return ""
+    message = data.get("message")
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content", [])
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for c in content:
+        if isinstance(c, dict) and c.get("type") == "text":
+            parts.append(c.get("text", "") or "")
+    return "".join(parts)
+
+
+def _extract_stream_result_text(data: dict) -> str | None:
+    """Полный ответ из терминального result-события stream-json."""
+    if data.get("type") != "result" or data.get("is_error"):
+        return None
+    result = data.get("result")
+    if isinstance(result, str) and result.strip():
+        return result
+    return None
 
 
 def _format_agent_status_text(status_history: list[str]) -> str:
@@ -944,6 +1026,7 @@ async def run_cursor_agent_streaming(
     last_edit_time = [0.0]
     STATUS_DEBOUNCE = 2.0
     assistant_parts: list[str] = []
+    result_text: str | None = None
     status_history: list[str] = []
     was_cancelled = False
 
@@ -1014,11 +1097,12 @@ async def run_cursor_agent_streaming(
                     await _update_status_msg()
                 try:
                     data = json.loads(line)
-                    if data.get("type") == "assistant":
-                        content = data.get("message", {}).get("content", [])
-                        for c in content:
-                            if isinstance(c, dict) and c.get("type") == "text":
-                                assistant_parts.append(c.get("text", ""))
+                    text = _extract_stream_assistant_text(data)
+                    if text:
+                        assistant_parts.append(text)
+                    rt = _extract_stream_result_text(data)
+                    if rt is not None:
+                        result_text = rt
                 except (json.JSONDecodeError, KeyError, TypeError):
                     pass
 
@@ -1039,12 +1123,19 @@ async def run_cursor_agent_streaming(
             err = stderr.decode("utf-8", errors="replace")[:500]
             return f"❌ Ошибка Cursor CLI:\n```\n{err}\n```", False, False
 
-        output = "".join(assistant_parts).strip() or "(пустой ответ)"
+        output = (result_text or "".join(assistant_parts).strip()) or "(пустой ответ)"
         return output, True, False
 
     try:
         return await asyncio.wait_for(_run(), timeout=CURSOR_TIMEOUT)
     except asyncio.TimeoutError:
+        if run_id and run_id in _active_agent_runs:
+            proc = _active_agent_runs[run_id].get("proc")
+            if proc is not None and proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
         return f"⏱ Превышено время ожидания ({CURSOR_TIMEOUT} сек)", False, False
     except FileNotFoundError:
         return (
@@ -1944,43 +2035,52 @@ async def _run_agent_for_user(
         '<tg-emoji emoji-id="5210764626857313664">🤖</tg-emoji> Инициализация...'
     )
 
-    response, success, cancelled = await run_cursor_agent_streaming(
-        prompt,
-        agent_cwd,
-        session_key=user_session_key(user_id),
-        status_msg=status_msg,
-        user_id=user_id,
-    )
+    try:
+        response, success, cancelled = await run_cursor_agent_streaming(
+            prompt,
+            agent_cwd,
+            session_key=user_session_key(user_id),
+            status_msg=status_msg,
+            user_id=user_id,
+        )
 
-    if cancelled:
-        await _send_response(status_msg, response, message, message.bot)
-        return
+        if cancelled:
+            await _send_response(status_msg, response, message, message.bot)
+            return
 
-    remaining_text, schedule_notes = _parse_schedule_reminders(
-        response, user_id, message.chat.id
-    )
-    remaining_text, send_docs = _parse_send_document(remaining_text)
-    bot = message.bot
-    for path, name, caption in send_docs:
-        resolved = _resolve_path(user_id, str(path))
-        if resolved and resolved.is_file():
-            try:
-                await message.answer_document(
-                    FSInputFile(resolved, filename=name),
-                    caption=caption or None,
-                )
-            except Exception as e:
-                logger.warning("Не удалось отправить файл %s: %s", path, e)
-                remaining_text = f"⛔ Не удалось отправить файл: {path}\n\n{remaining_text}"
+        remaining_text, schedule_notes = _parse_schedule_reminders(
+            response, user_id, message.chat.id
+        )
+        remaining_text, send_docs = _parse_send_document(remaining_text)
+        bot = message.bot
+        for path, name, caption in send_docs:
+            resolved = _resolve_path(user_id, str(path))
+            if resolved and resolved.is_file():
+                try:
+                    await message.answer_document(
+                        FSInputFile(resolved, filename=name),
+                        caption=caption or None,
+                    )
+                except Exception as e:
+                    logger.warning("Не удалось отправить файл %s: %s", path, e)
+                    remaining_text = f"⛔ Не удалось отправить файл: {path}\n\n{remaining_text}"
 
-    final_text = remaining_text or "(пустой ответ)"
-    if schedule_notes:
-        notes_block = "\n".join(schedule_notes)
-        final_text = f"{final_text}\n\n{notes_block}" if final_text != "(пустой ответ)" else notes_block
-    await _send_response(status_msg, final_text, message, bot)
+        final_text = remaining_text or "(пустой ответ)"
+        if schedule_notes:
+            notes_block = "\n".join(schedule_notes)
+            final_text = f"{final_text}\n\n{notes_block}" if final_text != "(пустой ответ)" else notes_block
+        await _send_response(status_msg, final_text, message, bot)
 
-    if success:
-        await _finalize_bot_changes(response, user_text, status_msg, message)
+        if success:
+            await _finalize_bot_changes(response, user_text, status_msg, message)
+    except Exception as e:
+        logger.exception("Ошибка обработки запроса user=%s", user_id)
+        await _send_response(
+            status_msg,
+            f"⛔ Ошибка обработки: {html.escape(str(e)[:500])}",
+            message,
+            message.bot,
+        )
 
 
 async def _run_headless_agent(prompt: str, user_id: int) -> tuple[str, bool]:
