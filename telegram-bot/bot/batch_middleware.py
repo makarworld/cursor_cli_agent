@@ -224,6 +224,11 @@ class MessageBatchMiddleware(BaseMiddleware):
         if not _is_agent_message(event):
             return await handler(event, data)
 
+        from .group_alert import is_alert_group_chat
+
+        if is_alert_group_chat(event.chat.id):
+            return await handler(event, data)
+
         from .main import is_allowed
 
         if not is_allowed(event.from_user.id):

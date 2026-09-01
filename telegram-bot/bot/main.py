@@ -47,7 +47,9 @@ from .agent_sessions import (
     load_agent_sessions,
     user_session_key,
 )
+from .admin_notify import notify_admin_error
 from .batch_middleware import MessageBatchMiddleware, setup_message_batch
+from .group_alert import configure as configure_group_alert, register_group_alert
 from .scheduler import (
     SCHEDULER_ENABLED,
     cancel_event,
@@ -710,6 +712,13 @@ async def _send_one_message(
                 document=FSInputFile(report_path, filename=report_path.name),
                 caption="Отчёт об ошибке",
             )
+            await notify_admin_error(
+                bot,
+                "Ошибка отправки в Telegram",
+                content,
+                source=f"chat_id={message.chat.id}",
+                extra=err_name,
+            )
         except Exception as send_err:
             logger.exception("Не удалось отправить отчёт: %s", send_err)
         return False
@@ -1120,8 +1129,16 @@ async def run_cursor_agent_streaming(
             return _format_stopped_response(status_history, partial), False, True
 
         if proc.returncode != 0:
-            err = stderr.decode("utf-8", errors="replace")[:500]
-            return f"❌ Ошибка Cursor CLI:\n```\n{err}\n```", False, False
+            err = stderr.decode("utf-8", errors="replace")
+            if status_msg is not None:
+                await notify_admin_error(
+                    status_msg.bot,
+                    "Cursor CLI завершился с ошибкой",
+                    err or f"exit code {proc.returncode}",
+                    source="run_cursor_agent_streaming",
+                )
+            preview = err[:500]
+            return f"❌ Ошибка Cursor CLI:\n```\n{preview}\n```", False, False
 
         output = (result_text or "".join(assistant_parts).strip()) or "(пустой ответ)"
         return output, True, False
@@ -2075,6 +2092,13 @@ async def _run_agent_for_user(
             await _finalize_bot_changes(response, user_text, status_msg, message)
     except Exception as e:
         logger.exception("Ошибка обработки запроса user=%s", user_id)
+        err_full = traceback.format_exc()
+        await notify_admin_error(
+            message.bot,
+            "Ошибка обработки запроса пользователя",
+            err_full,
+            source=f"user_id={user_id}",
+        )
         await _send_response(
             status_msg,
             f"⛔ Ошибка обработки: {html.escape(str(e)[:500])}",
@@ -2348,6 +2372,12 @@ async def handle_message(message: Message) -> None:
     if message.text.strip().startswith("/"):
         return
 
+    from .group_alert import handle_group_alert_message, is_alert_group_chat
+
+    if is_alert_group_chat(message.chat.id):
+        await handle_group_alert_message(message)
+        return
+
     if not is_allowed(message.from_user.id):
         await message.answer("⛔ Доступ запрещён.")
         return
@@ -2378,6 +2408,13 @@ async def global_error_handler(event: ErrorEvent) -> None:
     ts = time.strftime("%Y%m%d_%H%M%S")
     report_path = ERROR_REPORTS_DIR / f"crash_{ts}.txt"
     report_path.write_text(err_text, encoding="utf-8")
+
+    await notify_admin_error(
+        event.bot,
+        f"Критическая ошибка: {type(event.exception).__name__}",
+        err_text,
+        source=f"user_id={msg.from_user.id} chat_id={msg.chat.id}",
+    )
 
     auto_fix_will_run = (
         self_modify_enabled()
@@ -2433,6 +2470,14 @@ async def main() -> None:
     global _bot_username
     me = await bot.get_me()
     _bot_username = me.username
+
+    configure_group_alert(
+        bot_username=_bot_username,
+        run_agent=run_cursor_agent_streaming,
+        is_allowed=is_allowed,
+        workspace_dir=WORKSPACE_DIR,
+    )
+    register_group_alert(dp)
 
     # Меню команд (подсказки при вводе /)
     await bot.set_my_commands(
