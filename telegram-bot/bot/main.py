@@ -21,7 +21,7 @@ from aiohttp import BasicAuth
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.enums import ParseMode
+from aiogram.enums import ChatAction, ParseMode
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import (
@@ -1034,6 +1034,7 @@ async def run_cursor_agent_streaming(
 
     last_edit_time = [0.0]
     STATUS_DEBOUNCE = 2.0
+    TYPING_REFRESH = 4.0
     assistant_parts: list[str] = []
     result_text: str | None = None
     status_history: list[str] = []
@@ -1053,95 +1054,119 @@ async def run_cursor_agent_streaming(
         except Exception:
             pass
 
-    async def _run() -> tuple[str, bool, bool]:
-        nonlocal was_cancelled
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            cwd=cwd,
-            env=env,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        if run_id and run_id in _active_agent_runs:
-            _active_agent_runs[run_id]["proc"] = proc
-
-        if status_msg is not None and run_id:
+    async def _typing_loop() -> None:
+        """Держит индикатор «печатает…» пока агент генерирует."""
+        if status_msg is None:
+            return
+        bot = status_msg.bot
+        chat_id = status_msg.chat.id
+        while True:
             try:
-                await status_msg.edit_text(
-                    _format_agent_status_text(status_history),
-                    reply_markup=_stop_agent_markup(run_id),
-                )
-                last_edit_time[0] = time.monotonic()
+                await bot.send_chat_action(chat_id, ChatAction.TYPING)
             except Exception:
                 pass
+            await asyncio.sleep(TYPING_REFRESH)
 
-        assert proc.stdout
-        buffer = ""
-        while True:
-            if cancelled_evt and cancelled_evt.is_set():
-                was_cancelled = True
-                if proc.returncode is None:
-                    proc.kill()
-                break
-            try:
-                chunk = await asyncio.wait_for(proc.stdout.read(4096), timeout=1.0)
-            except asyncio.TimeoutError:
-                if proc.returncode is not None:
-                    break
-                continue
-            if not chunk:
-                break
-            buffer += chunk.decode("utf-8", errors="replace")
-            while "\n" in buffer:
-                line, buffer = buffer.split("\n", 1)
-                line = line.strip()
-                if not line:
-                    continue
-                status = _parse_stream_status(line)
-                if status:
-                    if not status_history or status_history[-1] != status:
-                        status_history.append(status)
-                    if run_id and run_id in _active_agent_runs:
-                        _active_agent_runs[run_id]["status_history"] = status_history
-                    await _update_status_msg()
+    async def _run() -> tuple[str, bool, bool]:
+        nonlocal was_cancelled
+        typing_task: asyncio.Task | None = None
+        if status_msg is not None:
+            typing_task = asyncio.create_task(_typing_loop())
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                cwd=cwd,
+                env=env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            if run_id and run_id in _active_agent_runs:
+                _active_agent_runs[run_id]["proc"] = proc
+
+            if status_msg is not None and run_id:
                 try:
-                    data = json.loads(line)
-                    text = _extract_stream_assistant_text(data)
-                    if text:
-                        assistant_parts.append(text)
-                    rt = _extract_stream_result_text(data)
-                    if rt is not None:
-                        result_text = rt
-                except (json.JSONDecodeError, KeyError, TypeError):
+                    await status_msg.edit_text(
+                        _format_agent_status_text(status_history),
+                        reply_markup=_stop_agent_markup(run_id),
+                    )
+                    last_edit_time[0] = time.monotonic()
+                except Exception:
                     pass
 
-        if cancelled_evt and cancelled_evt.is_set():
-            was_cancelled = True
+            assert proc.stdout
+            buffer = ""
+            while True:
+                if cancelled_evt and cancelled_evt.is_set():
+                    was_cancelled = True
+                    if proc.returncode is None:
+                        proc.kill()
+                    break
+                try:
+                    chunk = await asyncio.wait_for(proc.stdout.read(4096), timeout=1.0)
+                except asyncio.TimeoutError:
+                    if proc.returncode is not None:
+                        break
+                    continue
+                if not chunk:
+                    break
+                buffer += chunk.decode("utf-8", errors="replace")
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    line = line.strip()
+                    if not line:
+                        continue
+                    status = _parse_stream_status(line)
+                    if status:
+                        if not status_history or status_history[-1] != status:
+                            status_history.append(status)
+                        if run_id and run_id in _active_agent_runs:
+                            _active_agent_runs[run_id]["status_history"] = status_history
+                        await _update_status_msg()
+                    try:
+                        data = json.loads(line)
+                        text = _extract_stream_assistant_text(data)
+                        if text:
+                            assistant_parts.append(text)
+                        rt = _extract_stream_result_text(data)
+                        if rt is not None:
+                            result_text = rt
+                    except (json.JSONDecodeError, KeyError, TypeError):
+                        pass
 
-        stderr = await proc.stderr.read() if proc.stderr else b""
-        try:
-            await proc.wait()
-        except ProcessLookupError:
-            pass
+            if cancelled_evt and cancelled_evt.is_set():
+                was_cancelled = True
 
-        if was_cancelled:
-            partial = "".join(assistant_parts).strip()
-            return _format_stopped_response(status_history, partial), False, True
+            stderr = await proc.stderr.read() if proc.stderr else b""
+            try:
+                await proc.wait()
+            except ProcessLookupError:
+                pass
 
-        if proc.returncode != 0:
-            err = stderr.decode("utf-8", errors="replace")
-            if status_msg is not None:
-                await notify_admin_error(
-                    status_msg.bot,
-                    "Cursor CLI завершился с ошибкой",
-                    err or f"exit code {proc.returncode}",
-                    source="run_cursor_agent_streaming",
-                )
-            preview = err[:500]
-            return f"❌ Ошибка Cursor CLI:\n```\n{preview}\n```", False, False
+            if was_cancelled:
+                partial = "".join(assistant_parts).strip()
+                return _format_stopped_response(status_history, partial), False, True
 
-        output = (result_text or "".join(assistant_parts).strip()) or "(пустой ответ)"
-        return output, True, False
+            if proc.returncode != 0:
+                err = stderr.decode("utf-8", errors="replace")
+                if status_msg is not None:
+                    await notify_admin_error(
+                        status_msg.bot,
+                        "Cursor CLI завершился с ошибкой",
+                        err or f"exit code {proc.returncode}",
+                        source="run_cursor_agent_streaming",
+                    )
+                preview = err[:500]
+                return f"❌ Ошибка Cursor CLI:\n```\n{preview}\n```", False, False
+
+            output = (result_text or "".join(assistant_parts).strip()) or "(пустой ответ)"
+            return output, True, False
+        finally:
+            if typing_task is not None:
+                typing_task.cancel()
+                try:
+                    await typing_task
+                except asyncio.CancelledError:
+                    pass
 
     try:
         return await asyncio.wait_for(_run(), timeout=CURSOR_TIMEOUT)
