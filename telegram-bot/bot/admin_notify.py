@@ -17,13 +17,18 @@ ERROR_REPORTS_DIR = Path(os.getenv("ERROR_REPORTS_DIR", "/workspace/.bot/errors"
 
 
 def admin_chat_id() -> int | None:
+    """ADMIN_CHAT_ID, иначе первый id из ALLOWED_USER_IDS."""
     raw = os.getenv("ADMIN_CHAT_ID", "").strip()
-    if not raw:
-        return None
-    try:
-        return int(raw)
-    except ValueError:
-        return None
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            pass
+    for part in os.getenv("ALLOWED_USER_IDS", "").split(","):
+        part = part.strip()
+        if part.isdigit():
+            return int(part)
+    return None
 
 
 async def notify_admin_error(

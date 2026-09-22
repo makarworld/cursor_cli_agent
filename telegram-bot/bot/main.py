@@ -55,10 +55,10 @@ from .scheduler import (
     cancel_event,
     create_linked_reminder,
     format_reminders_grouped,
+    get_scheduler_status,
     list_events,
     start_scheduler,
 )
-from .todoist_client import TodoistError
 from .self_modify import (
     SELF_MODIFY_AUTO_FIX,
     SELF_MODIFY_CODEWORDS,
@@ -249,7 +249,7 @@ def _parse_schedule_reminders(
 ) -> tuple[str, list[str]]:
     """
     Извлекает schedule_reminder::ISO_DATETIME::заголовок::контекст.
-    Время = начало события; Todoist + TG-пинги −5ч/−1ч.
+    Время = момент уведомления (UTC); локальная БД, без Todoist.
     """
     if not SCHEDULER_ENABLED:
         return text, []
@@ -268,20 +268,13 @@ def _parse_schedule_reminders(
         dt_str, title = parts[0].strip(), parts[1].strip()
         body = parts[2].strip() if len(parts) > 2 else ""
         try:
-            starts_at = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
-            if starts_at.tzinfo is not None:
-                starts_at = starts_at.astimezone(timezone.utc).replace(tzinfo=None)
-            events = create_linked_reminder(user_id, chat_id, title, starts_at, body)
-            at_fmt = starts_at.strftime("%d.%m.%Y %H:%M UTC")
-            if not events:
-                confirmations.append(
-                    f"⏰ Todoist: {title} (начало {at_fmt}) — TG-пинг пропущен (зубы/таблетки или оба offset в прошлом)"
-                )
-            else:
-                ids = ", ".join(f"#{e.id}" for e in events)
-                confirmations.append(
-                    f"⏰ Todoist + пинги в TG за 5ч и за 1ч до {at_fmt}: {title} ({ids})"
-                )
+            remind_at = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+            if remind_at.tzinfo is not None:
+                remind_at = remind_at.astimezone(timezone.utc).replace(tzinfo=None)
+            events = create_linked_reminder(user_id, chat_id, title, remind_at, body)
+            at_fmt = remind_at.strftime("%d.%m.%Y %H:%M UTC")
+            ids = ", ".join(f"#{e.id}" for e in events)
+            confirmations.append(f"Напоминание на {at_fmt}: {title} ({ids})")
         except Exception as e:
             logger.warning("Не удалось создать напоминание: %s — %s", rest[:80], e)
             confirmations.append(f"⛔ Не удалось запланировать: {title or dt_str} ({e})")
@@ -1541,7 +1534,7 @@ async def cmd_start(message: Message) -> None:
         "/bot_git_status — статус git (изменения бота)\n"
         "/bot_git_log — последние коммиты бота\n"
         "/bot_rollback — откатить последний коммит бота\n"
-        "/remind &lt;начало&gt; &lt;текст&gt; — событие в Todoist + пинги TG −5ч/−1ч\n"
+        "/remind &lt;время&gt; &lt;текст&gt; — локальное напоминание (без Todoist)\n"
         "/reminders — список запланированных напоминаний\n"
         "/cancel_reminder &lt;id&gt; — отменить напоминание",
     )
@@ -1560,8 +1553,14 @@ async def cmd_status(message: Message) -> None:
     self_mod = "✅" if self_modify_enabled() else "❌"
     git_ok = "✅" if repo_ready() else "❌"
 
+    sched = get_scheduler_status()
+    sched_line = (
+        f"{'✅' if SCHEDULER_ENABLED else '❌'} "
+        f"({sched.get('status', '?')}, due={sched.get('due_count', 0)})"
+    )
+
     await message.answer(
-        f"📊 <b>Статус</b>\n\n"
+        f"<b>Статус</b>\n\n"
         f"CURSOR_API_KEY: {has_key}\n"
         f"MEM0_API_KEY: {has_mem0}\n"
         f"Рабочая директория: {workspace_exists} (<code>{WORKSPACE_DIR}</code>)\n"
@@ -1572,7 +1571,7 @@ async def cmd_status(message: Message) -> None:
         f"Автофикс ошибок: {'✅' if SELF_MODIFY_AUTO_FIX else '❌'}\n"
         f"Кодовое слово: {'✅ обязательно' if codeword_required() else '❌ выкл'} "
         f"({', '.join(SELF_MODIFY_CODEWORDS)})\n"
-        f"Планировщик: {'✅' if SCHEDULER_ENABLED else '❌'}",
+        f"Планировщик: {sched_line}",
     )
 
 
@@ -1627,8 +1626,8 @@ async def cmd_help(message: Message) -> None:
         "/bot_git_status — изменения в git\n"
         "/bot_git_log — история коммитов\n"
         "/bot_rollback [N] — откат N коммитов\n\n"
-        "Напоминания: Todoist + пинги в TG за 5ч и за 1ч до начала.\n"
-        "Примеры: /remind 2025-06-09 15:00 деплой | «напомни завтра в 10 про ...»\n"
+        "Напоминания: локальная БД, одно уведомление в указанное время (UTC).\n"
+        "Примеры: /remind +30m деплой | /remind 2025-06-09 15:00 деплой\n"
         "/reminders — список, /cancel_reminder &lt;id&gt; — отмена",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -1677,7 +1676,7 @@ async def cmd_bot_git_log(message: Message, command: CommandObject) -> None:
 
 @dp.message(Command("remind"))
 async def cmd_remind(message: Message, command: CommandObject) -> None:
-    """Команда /remind — создать напоминание без агента."""
+    """Команда /remind — создать локальное напоминание без агента."""
     if not is_allowed(message.from_user.id):
         await message.answer("⛔ Доступ запрещён.")
         return
@@ -1693,30 +1692,21 @@ async def cmd_remind(message: Message, command: CommandObject) -> None:
             "<code>/remind +6h текст</code>\n"
             "<code>/remind 2025-06-09 15:00 текст</code>\n"
             "<code>/remind 09.06.2025 15:00 текст</code>\n\n"
-            "Время = начало события (UTC). В TG уйдут пинги за 5ч и за 1ч "
-            "(если эти моменты ещё в будущем). Нужен TODOIST_API_KEY."
+            "Время = момент уведомления (UTC). Хранится локально, Todoist не нужен."
         )
         return
 
-    starts_at, title = parsed
+    remind_at, title = parsed
     try:
         events = create_linked_reminder(
-            message.from_user.id, message.chat.id, title, starts_at
+            message.from_user.id, message.chat.id, title, remind_at
         )
-        at_fmt = starts_at.strftime("%d.%m.%Y %H:%M UTC")
-        if not events:
-            await message.answer(
-                f"⏰ Todoist: <b>{html.escape(title)}</b> (начало {at_fmt})\n"
-                "TG-пинг пропущен (зубы/таблетки или оба offset уже в прошлом)."
-            )
-        else:
-            ids = ", ".join(f"<code>#{e.id}</code>" for e in events)
-            await message.answer(
-                f"⏰ Todoist + пинги в TG за 5ч и за 1ч до {at_fmt}:\n"
-                f"{html.escape(title)}\n{ids}"
-            )
-    except TodoistError as e:
-        await message.answer(f"⛔ Todoist: {html.escape(str(e))}")
+        at_fmt = remind_at.strftime("%d.%m.%Y %H:%M UTC")
+        ids = ", ".join(f"<code>#{e.id}</code>" for e in events)
+        await message.answer(
+            f"Напоминание на <code>{at_fmt}</code>:\n"
+            f"{html.escape(title)}\n{ids}"
+        )
     except Exception as e:
         await message.answer(f"⛔ Не удалось создать: {html.escape(str(e))}")
 
@@ -1734,18 +1724,18 @@ async def cmd_reminders(message: Message) -> None:
     events = list_events(message.from_user.id)
     if not events:
         await message.answer(
-            "📭 Нет активных напоминаний.\n\n"
-            "Напиши, например: «напомни мне завтра в 10:00 проверить деплой»"
+            "Нет активных напоминаний.\n\n"
+            "Пример: /remind +30m проверить деплой"
         )
         return
 
     body = format_reminders_grouped(events, escape_html=html.escape)
-    await message.answer("⏰ <b>Запланированные напоминания</b>\n\n" + body)
+    await message.answer("<b>Запланированные напоминания</b>\n\n" + body)
 
 
 @dp.message(Command("cancel_reminder"))
 async def cmd_cancel_reminder(message: Message, command: CommandObject) -> None:
-    """Отмена напоминания по ID (и siblings + Todoist)."""
+    """Отмена напоминания по ID."""
     if not is_allowed(message.from_user.id):
         await message.answer("⛔ Доступ запрещён.")
         return
@@ -1760,10 +1750,7 @@ async def cmd_cancel_reminder(message: Message, command: CommandObject) -> None:
 
     event_id = int(args.split()[0])
     if cancel_event(event_id, message.from_user.id):
-        await message.answer(
-            f"🗑 Напоминание <code>#{event_id}</code> отменено "
-            "(включая парный пинг и задачу в Todoist)."
-        )
+        await message.answer(f"Напоминание <code>#{event_id}</code> отменено.")
     else:
         await message.answer(
             f"⛔ Напоминание <code>#{event_id}</code> не найдено или уже сработало."
