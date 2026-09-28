@@ -2157,7 +2157,7 @@ async def _save_telegram_photo(message: Message) -> tuple[Path, str] | None:
 
 async def _save_media_from_message(message: Message) -> list[tuple[str, Path, str]]:
     """
-    Скачивает photo/document/video из сообщения в files/.
+    Скачивает photo/document/video/audio/voice из сообщения в files/.
     Возвращает список (kind, abs_path, rel_path). Без сообщений об ошибке в чат.
     """
     out: list[tuple[str, Path, str]] = []
@@ -2194,6 +2194,33 @@ async def _save_media_from_message(message: Message) -> list[tuple[str, Path, st
         except Exception as e:
             logger.warning("Не удалось сохранить video из reply: %s", e)
 
+    if message.audio:
+        audio = message.audio
+        ext = ""
+        if audio.file_name and "." in audio.file_name:
+            ext = "." + audio.file_name.rsplit(".", 1)[-1]
+        elif audio.mime_type and "/" in audio.mime_type:
+            ext = "." + audio.mime_type.split("/", 1)[-1]
+        else:
+            ext = ".mp3"
+        filename = audio.file_name or f"audio_{audio.file_unique_id}{ext}"
+        dest = _get_unique_file_path(FILES_DIR, filename)
+        try:
+            await bot.download(audio, destination=dest)
+            out.append(("audio", dest, f"files/{dest.name}"))
+        except Exception as e:
+            logger.warning("Не удалось сохранить audio из reply: %s", e)
+
+    if message.voice:
+        voice = message.voice
+        filename = f"voice_{voice.file_unique_id}.ogg"
+        dest = _get_unique_file_path(FILES_DIR, filename)
+        try:
+            await bot.download(voice, destination=dest)
+            out.append(("voice", dest, f"files/{dest.name}"))
+        except Exception as e:
+            logger.warning("Не удалось сохранить voice из reply: %s", e)
+
     return out
 
 
@@ -2209,6 +2236,10 @@ def _format_reply_media_block(
         elif kind == "video":
             lines.append(f"Видео: @{abs_path}")
             lines.append(f"Файл в workspace: {rel}")
+        elif kind in ("audio", "voice"):
+            label = "Аудио" if kind == "audio" else "Голосовое"
+            lines.append(f"{label}: @{abs_path}")
+            lines.append(f"Файл в workspace: {rel}")
         else:
             lines.append(f"Файл: {rel}")
             lines.append(f"Абсолютный путь: @{abs_path}")
@@ -2219,9 +2250,11 @@ def _format_reply_media_block(
 
 
 async def _enrich_prompt_with_reply_media(message: Message, prompt_body: str) -> str:
-    """Если сообщение — reply на фото/файл/видео, скачивает медиа и добавляет в промпт."""
+    """Если сообщение — reply на медиа, скачивает и добавляет в промпт."""
     reply = message.reply_to_message
-    if not reply or not (reply.photo or reply.document or reply.video):
+    if not reply or not (
+        reply.photo or reply.document or reply.video or reply.audio or reply.voice
+    ):
         return prompt_body
     saved = await _save_media_from_message(reply)
     if not saved:
