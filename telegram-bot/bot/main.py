@@ -2058,6 +2058,7 @@ async def _run_agent_for_user(
 ) -> None:
     """Запускает cursor-agent и отправляет ответ пользователю."""
     user_id = message.from_user.id
+    prompt_body = await _enrich_prompt_with_reply_media(message, prompt_body)
     prompt, agent_cwd = _build_agent_prompt(user_id, user_text, prompt_body)
 
     status_msg = await message.answer(
@@ -2152,6 +2153,82 @@ async def _save_telegram_photo(message: Message) -> tuple[Path, str] | None:
         logger.exception("Ошибка сохранения фото: %s", e)
         await message.answer(f"⛔ Не удалось сохранить фото: {e}")
         return None
+
+
+async def _save_media_from_message(message: Message) -> list[tuple[str, Path, str]]:
+    """
+    Скачивает photo/document/video из сообщения в files/.
+    Возвращает список (kind, abs_path, rel_path). Без сообщений об ошибке в чат.
+    """
+    out: list[tuple[str, Path, str]] = []
+    bot = message.bot
+    FILES_DIR.mkdir(parents=True, exist_ok=True)
+
+    if message.photo:
+        photo = message.photo[-1]
+        filename = f"photo_{photo.file_unique_id}.jpg"
+        dest = _get_unique_file_path(FILES_DIR, filename)
+        try:
+            await bot.download(photo, destination=dest)
+            out.append(("photo", dest, f"files/{dest.name}"))
+        except Exception as e:
+            logger.warning("Не удалось сохранить photo из reply: %s", e)
+
+    if message.document:
+        doc = message.document
+        filename = doc.file_name or f"document_{doc.file_unique_id}"
+        dest = _get_unique_file_path(FILES_DIR, filename)
+        try:
+            await bot.download(doc, destination=dest)
+            out.append(("document", dest, f"files/{dest.name}"))
+        except Exception as e:
+            logger.warning("Не удалось сохранить document из reply: %s", e)
+
+    if message.video:
+        video = message.video
+        filename = video.file_name or f"video_{video.file_unique_id}.mp4"
+        dest = _get_unique_file_path(FILES_DIR, filename)
+        try:
+            await bot.download(video, destination=dest)
+            out.append(("video", dest, f"files/{dest.name}"))
+        except Exception as e:
+            logger.warning("Не удалось сохранить video из reply: %s", e)
+
+    return out
+
+
+def _format_reply_media_block(
+    saved: list[tuple[str, Path, str]],
+    reply_text: str = "",
+) -> str:
+    lines = ["[Медиа из reply-сообщения]"]
+    for kind, abs_path, rel in saved:
+        if kind == "photo":
+            lines.append(f"Изображение: @{abs_path}")
+            lines.append(f"Файл в workspace: {rel}")
+        elif kind == "video":
+            lines.append(f"Видео: @{abs_path}")
+            lines.append(f"Файл в workspace: {rel}")
+        else:
+            lines.append(f"Файл: {rel}")
+            lines.append(f"Абсолютный путь: @{abs_path}")
+    if reply_text:
+        lines.append(f"Текст reply-сообщения: {reply_text[:2000]}")
+    lines.append("Учти эти файлы как контекст к запросу пользователя.")
+    return "\n".join(lines)
+
+
+async def _enrich_prompt_with_reply_media(message: Message, prompt_body: str) -> str:
+    """Если сообщение — reply на фото/файл/видео, скачивает медиа и добавляет в промпт."""
+    reply = message.reply_to_message
+    if not reply or not (reply.photo or reply.document or reply.video):
+        return prompt_body
+    saved = await _save_media_from_message(reply)
+    if not saved:
+        return prompt_body
+    reply_text = (reply.caption or reply.text or "").strip()
+    block = _format_reply_media_block(saved, reply_text)
+    return f"{block}\n\n{prompt_body}"
 
 
 def _build_photo_prompt(rel_path: str, abs_path: Path, caption: str) -> str:
